@@ -1,7 +1,7 @@
 [project]
-name = "user-monitoring"
+name = "hyperliquid-position-monitor"
 version = "0.1.0"
-description = "Add your description here"
+description = "Hyperliquid position monitoring system"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.8"
 dependencies = []
