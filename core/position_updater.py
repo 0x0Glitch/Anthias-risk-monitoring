@@ -138,10 +138,15 @@ class PositionUpdater:
         pos_info = position.get('position', {})
         margin_summary = full_data.get('marginSummary', {})
         
+        # Calculate liquidation price if not provided by API
+        liquidation_price = self._safe_decimal(pos_info.get('liquidationPx'))
+        if not liquidation_price and pos_info.get('leverageType') == 'cross':
+            liquidation_price = self._calculate_liquidation_price(pos_info, margin_summary)
+        
         return {
             'position_size': self._safe_decimal(pos_info.get('szi')),
             'entry_price': self._safe_decimal(pos_info.get('entryPx')),
-            'liquidation_price': self._safe_decimal(pos_info.get('liquidationPx')),
+            'liquidation_price': liquidation_price,
             'margin_used': self._safe_decimal(pos_info.get('marginUsed')),
             'position_value': self._calculate_position_value(pos_info),
             'unrealized_pnl': self._safe_decimal(pos_info.get('unrealizedPnl')),
@@ -153,6 +158,61 @@ class PositionUpdater:
             'total_margin_used': self._safe_decimal(margin_summary.get('totalMarginUsed')),
             'withdrawable': self._safe_decimal(margin_summary.get('withdrawable'))
         }
+    
+    def _calculate_liquidation_price(self, position: Dict, margin_summary: Dict) -> Optional[Decimal]:
+        """Calculate liquidation price for cross margin positions."""
+        try:
+            from ..config.constants import MARGIN_TIERS
+            
+            market = position.get('coin', '')
+            position_size = self._safe_decimal(position.get('szi'))
+            entry_price = self._safe_decimal(position.get('entryPx'))
+            account_value = self._safe_decimal(margin_summary.get('accountValue'))
+            
+            if not all([position_size, entry_price, account_value]):
+                return None
+            
+            # Determine position side (1 for long, -1 for short)
+            side = 1 if position_size > 0 else -1
+            position_value = abs(position_size) * entry_price
+            
+            # Get margin tier for this market and position value
+            tiers = MARGIN_TIERS.get(market, MARGIN_TIERS['DEFAULT'])
+            max_leverage = None
+            
+            for tier in tiers:
+                if tier['min_value'] <= float(position_value) < tier['max_value']:
+                    max_leverage = tier['max_leverage']
+                    break
+            
+            if not max_leverage:
+                return None
+            
+            # Use 80% of max leverage as maintenance leverage (conservative estimate)
+            maintenance_leverage = max_leverage * 0.8
+            maintenance_margin_ratio = 1 / maintenance_leverage
+            
+            # Calculate margin available (simplified)
+            margin_available = account_value * Decimal('0.9')  # Conservative estimate
+            
+            # Liquidation price formula for cross margin
+            # liq_price = price - side * margin_available / position_size / (1 - maintenance_margin_ratio * side)
+            denominator = 1 - (maintenance_margin_ratio * side)
+            if abs(denominator) < 0.001:  # Avoid division by zero
+                return None
+                
+            liquidation_adjustment = (side * margin_available / abs(position_size)) / Decimal(str(denominator))
+            liquidation_price = entry_price - liquidation_adjustment
+            
+            # Ensure liquidation price is positive
+            if liquidation_price <= 0:
+                return None
+                
+            return liquidation_price
+            
+        except Exception as e:
+            self.logger.debug(f"Failed to calculate liquidation price: {e}")
+            return None
     
     def _calculate_position_value(self, position: Dict) -> Optional[Decimal]:
         """Calculate position value in USD."""
