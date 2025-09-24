@@ -2,7 +2,7 @@
 import json
 import msgpack
 from typing import Any, Optional, Union
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import logging
 
 
