@@ -22,8 +22,7 @@ from config.constants import (
 from core.snapshot_processor import SnapshotProcessor
 from core.address_manager import AddressManager
 from core.position_updater import PositionUpdater
-from core.system_monitor import SystemMonitor
-from db.connection import DatabaseManager
+from db.db_manager import DatabaseManager
 
 
 @dataclass
@@ -102,7 +101,7 @@ class HyperliquidMonitor:
         self.snapshot_processor = SnapshotProcessor(config)
         self.address_manager = AddressManager(config)
         self.position_updater = PositionUpdater(config, self.db_manager)
-        self.system_monitor = SystemMonitor()
+        # Removed system_monitor as it doesn't exist in HIP3-users
         
         # Health monitoring
         self.component_health = {
@@ -110,7 +109,6 @@ class HyperliquidMonitor:
             'snapshot_processor': ComponentHealth('snapshot_processor', True),
             'position_updater': ComponentHealth('position_updater', True),
             'address_manager': ComponentHealth('address_manager', True),
-            'system_monitor': ComponentHealth('system_monitor', True)
         }
         
         # Statistics
