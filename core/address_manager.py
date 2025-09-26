@@ -98,36 +98,78 @@ class AddressManager:
                                 continue
                             
                             # Add to general set and all target markets
-                            address = line.lower().strip()
+                            address = line.lower()
                             self.active_addresses.add(address)
                             for market in self.config.target_markets:
                                 self.addresses_by_market[market].add(address)
-                    
-                    except ValueError as e:
-                        logger.warning(f"Error parsing line '{line}': {e}")
-                        continue
+                        
+                    except Exception as e:
+                        logger.warning(f"Error processing address line {line}: {e}")
             
+            # Log detailed loading results
             total_addresses = len(self.active_addresses)
-            by_market = {market: len(addrs) for market, addrs in self.addresses_by_market.items()}
-            logger.info(f"Loaded {total_addresses} addresses: {by_market}")
+            logger.info(f"Loaded {total_addresses} active addresses")
             
+            for market, addresses in self.addresses_by_market.items():
+                if addresses:
+                    logger.info(f"  {market}: {len(addresses)} addresses")
+                    
+            if total_addresses > 0 and all(len(addrs) == 0 for addrs in self.addresses_by_market.values()):
+                logger.warning("⚠ Addresses loaded but none assigned to target markets!")
+            
+        except FileNotFoundError:
+            logger.info(f"Creating new active addresses file: {self.addresses_file}")
+            self.addresses_file.parent.mkdir(parents=True, exist_ok=True)
+            self.addresses_file.touch()
         except Exception as e:
-            logger.error(f"Failed to load addresses from {self.addresses_file}: {e}")
+            logger.error(f"Error loading addresses: {e}")
+            # Continue with empty set on error
+            self.active_addresses = set()
+            self.addresses_by_market = {market: set() for market in self.config.target_markets}
     
-    def _save_addresses(self):
-        """Save addresses to file in a consistent format."""
+    async def add_addresses_batch(self, market: str, addresses: set, flush_to_disk: bool = True):
+        """Add addresses in batch with immediate persistence"""
+        with self.lock:
+            # Add to memory
+            if market not in self.addresses_by_market:
+                self.addresses_by_market[market] = set()
+                
+            new_addresses = addresses - self.addresses_by_market[market]
+            if new_addresses:
+                self.addresses_by_market[market].update(new_addresses)
+                self.active_addresses.update(new_addresses)
+                
+                # Immediate disk flush if requested
+                if flush_to_disk and len(new_addresses) > 0:
+                    self._persist_addresses()
+                    
+                return len(new_addresses)
+        return 0
+    
+    def _persist_addresses(self):
+        """Persist current addresses to disk immediately"""
+        try:
+            with open(self.addresses_file, 'w') as f:
+                for market, addresses in self.addresses_by_market.items():
+                    for addr in sorted(addresses):
+                        f.write(f"{market}:{addr}\n")
+        except Exception as e:
+            logger.error(f"Error persisting addresses: {e}")
+    
+    def _save_to_file(self):
+        """Save addresses to persistent file with atomic write."""
+        
+        tmp_path = Path(str(self.addresses_file) + '.tmp')
         
         try:
-            # Write to temp file first for atomicity
-            temp_file = self.addresses_file.with_suffix('.tmp')
-            
-            with open(temp_file, 'w') as f:
-                f.write(f"# Active addresses for Hyperliquid position monitoring\n")
+            with open(tmp_path, 'w') as f:
+                # Write header
+                f.write(f"# Active addresses for Hyperliquid monitoring\n")
                 f.write(f"# Generated: {datetime.now().isoformat()}\n")
-                f.write(f"# Total unique addresses: {len(self.active_addresses)}\n")
-                f.write(f"# Format: MARKET:address\n\n")
+                f.write(f"# Format: market:address\n\n")
                 
-                for market in sorted(self.config.target_markets):
+                # Write addresses sorted by market and address
+                for market in sorted(self.addresses_by_market.keys()):
                     addresses = self.addresses_by_market[market]
                     if addresses:
                         f.write(f"# {market} ({len(addresses)} addresses)\n")
@@ -135,207 +177,289 @@ class AddressManager:
                             f.write(f"{market}:{address}\n")
                         f.write("\n")
             
-            # Atomic replacement
-            temp_file.replace(self.addresses_file)
-            logger.debug(f"Saved {len(self.active_addresses)} addresses to file")
+            # Atomic replace
+            tmp_path.replace(self.addresses_file)
+            logger.debug(f"Saved {sum(len(a) for a in self.addresses_by_market.values())} addresses to file")
             
         except Exception as e:
-            logger.error(f"Failed to save addresses to {self.addresses_file}: {e}")
+            logger.error(f"Error saving addresses to file: {e}")
+            if tmp_path.exists():
+                tmp_path.unlink()
     
-    def get_addresses_by_market(self) -> Dict[str, Set[str]]:
-        """Get current addresses organized by market."""
-        with self.lock:
-            return {market: addresses.copy() for market, addresses in self.addresses_by_market.items()}
-    
-    def get_all_addresses(self) -> Set[str]:
-        """Get all unique addresses across all markets."""
-        with self.lock:
-            return self.active_addresses.copy()
-    
-    def get_address_count(self) -> Dict[str, int]:
-        """Get count of addresses per market."""
-        with self.lock:
-            return {
-                market: len(addresses) 
-                for market, addresses in self.addresses_by_market.items()
-            }
-    
-    async def replace_addresses(self, users_by_market: Dict[str, Set[str]]) -> Dict[str, int]:
+    async def update_from_snapshot(self, snapshot_addresses: Dict[str, Set[str]]) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
         """
-        REPLACE ALL ADDRESSES with those from snapshot.
-        This is the FULL REPLACE approach - we trust the snapshot completely.
+        Update addresses from new snapshot with dual-check logic.
         
         Args:
-            users_by_market: New addresses from snapshot processing
+            snapshot_addresses: Dictionary of market -> addresses from snapshot
             
         Returns:
-            Dict with stats: added, removed, total
+            Tuple of (new_addresses, removal_candidates)
         """
         
         with self.lock:
-            # Track what we had before
-            old_addresses = self.active_addresses.copy()
-            old_by_market = {market: addresses.copy() for market, addresses in self.addresses_by_market.items()}
+            new_addresses = {market: set() for market in self.config.target_markets}
+            new_removal_candidates = {market: set() for market in self.config.target_markets}
             
-            # CLEAR EVERYTHING and replace with snapshot data
-            self.active_addresses.clear()
             for market in self.config.target_markets:
-                self.addresses_by_market[market].clear()
+                current_snapshot = snapshot_addresses.get(market, set())
+                current_active = self.addresses_by_market[market]
+                previous_snapshot = self.last_snapshot_addresses[market]
+                
+                # Find new addresses
+                new = current_snapshot - current_active
+                if new:
+                    new_addresses[market] = new
+                    self.addresses_by_market[market].update(new)
+                    logger.info(f"Added {len(new)} new {market} addresses")
+                
+                # Find removal candidates (in previous snapshot but not in current)
+                if previous_snapshot:
+                    # Addresses that were in previous snapshot but not in current
+                    disappeared = previous_snapshot - current_snapshot
+                    
+                    # Only consider for removal if they're currently active
+                    candidates = disappeared & current_active
+                    
+                    if candidates:
+                        new_removal_candidates[market] = candidates
+                        self.removal_candidates[market].update(candidates)
+                        logger.info(f"Marked {len(candidates)} {market} addresses as removal candidates")
+                
+                # Update last snapshot
+                self.last_snapshot_addresses[market] = current_snapshot.copy()
             
-            # Add new addresses from snapshot
-            for market, addresses in users_by_market.items():
-                if market in self.config.target_markets:
-                    # Add to market-specific set
-                    self.addresses_by_market[market].update(addresses)
-                    # Add to general active set
-                    self.active_addresses.update(addresses)
+            # Save updated addresses to file
+            if any(new_addresses.values()):
+                self._save_to_file()
             
-            # Calculate stats
-            new_addresses = self.active_addresses.copy()
+            return new_addresses, new_removal_candidates
+    
+    async def confirm_removals(self, closed_positions: Dict[str, Set[str]]):
+        """
+        Confirm removal of addresses with closed positions (dual-check complete).
+        
+        Args:
+            closed_positions: Dictionary of market -> addresses with closed positions
+        """
+        
+        with self.lock:
+            total_removed = 0
             
-            added = new_addresses - old_addresses
-            removed = old_addresses - new_addresses
+            for market, closed_addrs in closed_positions.items():
+                # Only remove if in removal candidates (dual-check)
+                to_remove = closed_addrs & self.removal_candidates[market]
+                
+                if to_remove:
+                    self.addresses_by_market[market] -= to_remove
+                    self.removal_candidates[market] -= to_remove
+                    total_removed += len(to_remove)
+                    
+                    logger.info(f"Removed {len(to_remove)} {market} addresses (dual-check confirmed)")
             
-            stats = {
-                'added': len(added),
-                'removed': len(removed),
-                'total': len(new_addresses)
-            }
+            if total_removed > 0:
+                self._save_to_file()
+    
+    def get_addresses(self, market: Optional[str] = None) -> Dict[str, Set[str]]:
+        """
+        Get active addresses.
+        
+        Args:
+            market: Optional market filter
             
-            # Update removal candidates
-            self.removal_candidates = {market: set() for market in self.config.target_markets}
+        Returns:
+            Dictionary of market -> addresses
+        """
+        
+        with self.lock:
+            if market:
+                return {market: self.addresses_by_market.get(market, set()).copy()}
+            else:
+                return {m: addrs.copy() for m, addrs in self.addresses_by_market.items()}
+    
+    def get_removal_candidates(self, market: Optional[str] = None) -> Dict[str, Set[str]]:
+        """Get addresses marked for potential removal."""
+        
+        with self.lock:
+            if market:
+                return {market: self.removal_candidates.get(market, set()).copy()}
+            else:
+                return {m: addrs.copy() for m, addrs in self.removal_candidates.items()}
+    
+    def get_all_addresses_flat(self) -> List[str]:
+        """Get all addresses as a sorted flat list (for sequential API calls)."""
+        
+        with self.lock:
+            all_addresses = set()
+            for addresses in self.addresses_by_market.values():
+                all_addresses.update(addresses)
+            return sorted(list(all_addresses))  # Sort for consistent processing order
+    
+    def get_address_count(self) -> int:
+        """Get total count of unique addresses being tracked."""
+        with self.lock:
+            return len(self.active_addresses)
+    
+    async def update_addresses(self, addresses_by_market: Dict[str, Set[str]]) -> int:
+        """
+        Update addresses from snapshot or other source.
+        
+        Args:
+            addresses_by_market: Dictionary of market -> set of addresses
             
-            # Save to file
-            self._save_addresses()
+        Returns:
+            Number of new addresses added
+        """
+        
+        with self.lock:
+            new_count = 0
             
-            logger.info(f"🔄 REPLACED ALL ADDRESSES: +{stats['added']} -{stats['removed']} = {stats['total']} total")
+            for market, addresses in addresses_by_market.items():
+                if market not in self.addresses_by_market:
+                    self.addresses_by_market[market] = set()
+                
+                # Add new addresses
+                before_count = len(self.addresses_by_market[market])
+                self.addresses_by_market[market].update(addresses)
+                after_count = len(self.addresses_by_market[market])
+                new_count += (after_count - before_count)
+                
+                # Update general active addresses set
+                self.active_addresses.update(addresses)
             
-            # Log by market for debugging
-            for market in self.config.target_markets:
-                old_count = len(old_by_market.get(market, set()))
-                new_count = len(self.addresses_by_market[market])
-                if old_count != new_count:
-                    logger.info(f"  {market}: {old_count} -> {new_count} ({new_count - old_count:+d})")
+            # Save to file if there are changes
+            if new_count > 0:
+                self._save_to_file()
+                logger.info(f"Added {new_count} new addresses from snapshot/update")
+            
+            return new_count
+    
+    async def replace_addresses(self, addresses_by_market: Dict[str, Set[str]]) -> Dict[str, int]:
+        """
+        Replace all addresses with a new set (for snapshot seeding).
+        This ensures we only track addresses with active positions.
+        
+        Args:
+            addresses_by_market: Dictionary of market -> set of addresses with active positions
+            
+        Returns:
+            Dictionary with counts: added, removed, total
+        """
+        
+        with self.lock:
+            stats = {'added': 0, 'removed': 0, 'total': 0}
+            
+            # Calculate what's being added and removed
+            for market, new_addresses in addresses_by_market.items():
+                if market not in self.addresses_by_market:
+                    self.addresses_by_market[market] = set()
+                
+                old_addresses = self.addresses_by_market[market]
+                
+                # Find additions and removals
+                added = new_addresses - old_addresses
+                removed = old_addresses - new_addresses
+                
+                stats['added'] += len(added)
+                stats['removed'] += len(removed)
+                
+                if added:
+                    logger.info(f"{market}: Adding {len(added)} new addresses with positions")
+                if removed:
+                    logger.info(f"{market}: Removing {len(removed)} addresses without positions")
+                
+                # Replace with new set
+                self.addresses_by_market[market] = new_addresses.copy()
+            
+            # Rebuild general active addresses set from all markets
+            self.active_addresses = set()
+            for addresses in self.addresses_by_market.values():
+                self.active_addresses.update(addresses)
+            
+            stats['total'] = len(self.active_addresses)
+            
+            # Always save to file to ensure consistency
+            self._save_to_file()
+            
+            logger.info(f"Address replacement complete: {stats['total']} total addresses "
+                       f"(+{stats['added']}/-{stats['removed']})")
+            
+            # Clear removal candidates since we've done a full replacement
+            for market in self.removal_candidates:
+                self.removal_candidates[market].clear()
             
             return stats
     
-    async def add_addresses(self, market: str, addresses: Set[str]) -> int:
-        """Add new addresses to a market."""
+    def get_addresses_by_market(self) -> Dict[str, Set[str]]:
+        """
+        Get all addresses grouped by market.
         
-        if market not in self.config.target_markets:
-            logger.warning(f"Cannot add addresses to non-target market: {market}")
-            return 0
-        
-        if not addresses:
-            return 0
-        
-        # Validate addresses
-        valid_addresses = set()
-        for address in addresses:
-            if self._is_valid_address(address):
-                valid_addresses.add(address.lower().strip())
-            else:
-                logger.warning(f"Invalid address format: {address}")
-        
-        if not valid_addresses:
-            return 0
+        Returns:
+            Dictionary of market -> set of addresses
+        """
         
         with self.lock:
-            # Track what's new
-            new_addresses = valid_addresses - self.addresses_by_market[market]
-            
-            if new_addresses:
-                # Add to market set
-                self.addresses_by_market[market].update(new_addresses)
-                # Add to general set
-                self.active_addresses.update(new_addresses)
-                
-                # Save to file
-                self._save_addresses()
-                
-                logger.info(f"Added {len(new_addresses)} new addresses to {market}")
-                return len(new_addresses)
-            else:
-                logger.debug(f"No new addresses to add for {market}")
-                return 0
+            return {market: addrs.copy() for market, addrs in self.addresses_by_market.items()}
     
-    async def remove_addresses(self, market: str, addresses: Set[str]) -> int:
-        """Remove addresses from a market."""
+    def get_all_addresses(self) -> Set[str]:
+        """
+        Get all unique addresses across all markets.
         
-        if market not in self.config.target_markets:
-            logger.warning(f"Cannot remove addresses from non-target market: {market}")
-            return 0
-        
-        if not addresses:
-            return 0
-        
-        # Normalize addresses
-        normalized_addresses = {addr.lower().strip() for addr in addresses}
+        Returns:
+            Set of all unique addresses
+        """
         
         with self.lock:
-            # Track what's actually being removed
-            to_remove = normalized_addresses & self.addresses_by_market[market]
-            
-            if to_remove:
-                # Remove from market set
-                self.addresses_by_market[market] -= to_remove
-                
-                # Remove from general set only if not in any other market
-                for address in to_remove:
-                    if not any(address in self.addresses_by_market[m] for m in self.config.target_markets):
-                        self.active_addresses.discard(address)
-                
-                # Save to file
-                self._save_addresses()
-                
-                logger.info(f"Removed {len(to_remove)} addresses from {market}")
-                return len(to_remove)
-            else:
-                logger.debug(f"No addresses to remove for {market}")
-                return 0
-    
-    def mark_for_removal(self, market: str, addresses: Set[str]):
-        """Mark addresses as candidates for removal."""
-        
-        if market not in self.config.target_markets:
-            return
-        
-        normalized = {addr.lower().strip() for addr in addresses}
-        
-        with self.lock:
-            self.removal_candidates[market].update(normalized)
-            logger.debug(f"Marked {len(normalized)} addresses for removal in {market}")
-    
-    def unmark_for_removal(self, market: str, addresses: Set[str]):
-        """Remove addresses from removal candidates."""
-        
-        if market not in self.config.target_markets:
-            return
-        
-        normalized = {addr.lower().strip() for addr in addresses}
-        
-        with self.lock:
-            self.removal_candidates[market] -= normalized
-            logger.debug(f"Unmarked {len(normalized)} addresses from removal in {market}")
-    
-    def get_removal_candidates(self) -> Dict[str, Set[str]]:
-        """Get current removal candidates by market."""
-        with self.lock:
-            return {
-                market: candidates.copy() 
-                for market, candidates in self.removal_candidates.items()
-            }
+            all_addresses = set()
+            for addresses in self.addresses_by_market.values():
+                all_addresses.update(addresses)
+            return all_addresses
     
     def get_stats(self) -> Dict[str, int]:
         """Get statistics about managed addresses."""
+        
         with self.lock:
             stats = {
-                'total_unique': len(self.active_addresses),
-                'total_removal_candidates': sum(len(candidates) for candidates in self.removal_candidates.values())
+                'total': sum(len(addrs) for addrs in self.addresses_by_market.values()),
+                'removal_candidates': sum(len(addrs) for addrs in self.removal_candidates.values())
             }
             
-            for market in self.config.target_markets:
-                stats[f'{market}_addresses'] = len(self.addresses_by_market[market])
-                stats[f'{market}_removal_candidates'] = len(self.removal_candidates[market])
+            for market, addresses in self.addresses_by_market.items():
+                stats[f'{market.lower()}_active'] = len(addresses)
+                stats[f'{market.lower()}_removal_candidates'] = len(self.removal_candidates[market])
             
             return stats
+    
+    def sync_with_database(self, db_addresses: Dict[str, Set[str]]):
+        """
+        Ensure consistency between address file and database.
+        
+        Args:
+            db_addresses: Dictionary of market -> addresses from database
+        """
+        
+        with self.lock:
+            changes = False
+            
+            for market in self.config.target_markets:
+                file_addrs = self.addresses_by_market[market]
+                db_addrs = db_addresses.get(market, set())
+                
+                # Find discrepancies
+                only_in_file = file_addrs - db_addrs
+                only_in_db = db_addrs - file_addrs
+                
+                if only_in_file:
+                    logger.warning(f"Found {len(only_in_file)} {market} addresses in file but not in DB")
+                    # These should be added to DB in next update cycle
+                
+                if only_in_db:
+                    logger.warning(f"Found {len(only_in_db)} {market} addresses in DB but not in file")
+                    # Add to file to maintain consistency
+                    self.addresses_by_market[market].update(only_in_db)
+                    changes = True
+            
+            if changes:
+                logger.info("Syncing address file with database state")
+                self._save_to_file()
+

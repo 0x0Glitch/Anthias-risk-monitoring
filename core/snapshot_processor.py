@@ -100,382 +100,12 @@ class SnapshotProcessor:
         sha256_hash = hashlib.sha256()
         try:
             with open(path, "rb") as f:
-                # Read file in chunks to handle large files
-                for chunk in iter(lambda: f.read(FileConfig.HASH_BLOCK_SIZE), b""):
-                    sha256_hash.update(chunk)
-            return sha256_hash.hexdigest()
+                for byte_block in iter(lambda: f.read(FileConfig.HASH_BLOCK_SIZE), b""):
+                    sha256_hash.update(byte_block)
+            return sha256_hash.hexdigest()[:16]
         except Exception as e:
-            logger.error(f"Error calculating hash for {path}: {e}")
-            return ""
-
-    def _parse_snapshot_info(self, snapshot_path: Path) -> Optional[SnapshotMetadata]:
-        """Parse snapshot metadata from path and file info."""
-        try:
-            file_stat = snapshot_path.stat()
-            file_hash = self._calculate_file_hash(snapshot_path)
-            
-            # Try to extract height and date from filename
-            # Common patterns: height_YYYYMMDD_HHMMSS or YYYYMMDD_height
-            filename = snapshot_path.name
-            height = 0
-            date = ""
-            
-            # Try different parsing strategies
-            parts = filename.replace('.rmp', '').replace('.msgpack', '').split('_')
-            for part in parts:
-                if part.isdigit():
-                    if len(part) == 8:  # Likely date YYYYMMDD
-                        try:
-                            datetime.strptime(part, '%Y%m%d')
-                            date = part
-                        except ValueError:
-                            pass
-                    elif len(part) > 8:  # Likely height (block number)
-                        height = int(part)
-            
-            if not date:
-                date = datetime.fromtimestamp(file_stat.st_mtime).strftime('%Y%m%d')
-            
-            return SnapshotMetadata(
-                path=snapshot_path,
-                height=height,
-                date=date,
-                size=file_stat.st_size,
-                hash=file_hash
-            )
-        except Exception as e:
-            logger.error(f"Error parsing snapshot info for {snapshot_path}: {e}")
-            return None
-
-    def _find_latest_snapshot(self) -> Optional[Path]:
-        """Find the most recent unprocessed snapshot."""
-        try:
-            snapshots_dir = self.config.snapshots_dir
-            if not snapshots_dir.exists():
-                logger.warning(f"Snapshots directory does not exist: {snapshots_dir}")
-                return None
-
-            # Find all RMP files
-            snapshot_files = []
-            for pattern in ['*.rmp', '*.msgpack']:
-                snapshot_files.extend(snapshots_dir.glob(pattern))
-
-            if not snapshot_files:
-                logger.warning(f"No snapshot files found in {snapshots_dir}")
-                return None
-
-            # Sort by modification time, newest first
-            snapshot_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-
-            # Return first unprocessed snapshot
-            for snapshot_file in snapshot_files:
-                file_hash = self._calculate_file_hash(snapshot_file)
-                if file_hash not in self.processed_snapshots:
-                    return snapshot_file
-
-            logger.info("All available snapshots have been processed")
-            return None
-
-        except Exception as e:
-            logger.error(f"Error finding latest snapshot: {e}")
-            return None
-
-    async def process_latest_snapshot(self) -> Tuple[bool, Dict[str, Set[str]]]:
-        """
-        Main entry point for processing snapshots.
-        Returns: (success, {market: {addresses}})
-        """
-        async with self.processing_lock:
-            metadata = await self.find_latest_unprocessed_snapshot()
-            if not metadata:
-                logger.debug("No new snapshots to process")
-                return False, {}
-
-            logger.info(f"Processing snapshot: height={metadata.height} date={metadata.date}")
-
-            try:
-                # DIRECT RMP PROCESSING - no JSON conversion needed!
-                positions = await self.extract_positions_from_rmp_direct(metadata.path, metadata)
-                return True, positions
-
-            except Exception as e:
-                logger.error(f"Failed to process RMP snapshot {metadata.path}: {e}")
-                metadata.status = ProcessingStatus.FAILED
-                return False, {}
-
-    async def _process_latest_snapshot_impl(self) -> Tuple[bool, Dict[str, Set[str]]]:
-        """Implementation of snapshot processing."""
-        try:
-            # Find latest unprocessed snapshot
-            snapshot_path = self._find_latest_snapshot()
-            if not snapshot_path:
-                logger.debug("No new snapshots to process")
-                return False, {}
-
-            # Parse snapshot metadata
-            metadata = self._parse_snapshot_info(snapshot_path)
-            if not metadata:
-                logger.error(f"Could not parse metadata for {snapshot_path}")
-                return False, {}
-
-            logger.info(f"Processing snapshot: {snapshot_path.name} (height: {metadata.height}, size: {metadata.size:,} bytes)")
-
-            # Mark as processing
-            metadata.status = ProcessingStatus.PROCESSING
-            self.processed_snapshots[metadata.hash] = metadata
-            self._save_state()
-
-            # Process the snapshot
-            start_time = datetime.now()
-            users_by_market = await self._extract_users_from_snapshot(snapshot_path)
-            processing_time = datetime.now() - start_time
-
-            if users_by_market:
-                # Mark as successful
-                metadata.status = ProcessingStatus.SUCCESS
-                metadata.processed_at = datetime.now()
-                
-                total_users = sum(len(users) for users in users_by_market.values())
-                logger.info(f"✓ Snapshot processed successfully in {processing_time.total_seconds():.2f}s")
-                logger.info(f"  Found {total_users} unique users across {len(users_by_market)} markets")
-                for market, users in users_by_market.items():
-                    if users:
-                        logger.info(f"  {market}: {len(users)} users")
-            else:
-                metadata.status = ProcessingStatus.FAILED
-                logger.warning("No users found in snapshot")
-
-            self.processed_snapshots[metadata.hash] = metadata
-            self._save_state()
-
-            return bool(users_by_market), users_by_market
-
-        except Exception as e:
-            logger.error(f"Error processing snapshot: {e}", exc_info=True)
-            return False, {}
-
-    async def _extract_users_from_snapshot(self, snapshot_path: Path) -> Dict[str, Set[str]]:
-        """
-        Extract users with positions from a snapshot.
-        
-        Returns:
-            Dict[str, Set[str]]: users_by_market
-        """
-        users_by_market = {market: set() for market in self.config.target_markets}
-        
-        try:
-            # Read and parse the msgpack file
-            with open(snapshot_path, 'rb') as f:
-                data = msgpack.unpack(f, strict_map_key=False)
-            
-            logger.info(f"Loaded snapshot data, analyzing structure...")
-            
-            # Navigate the data structure to find position information
-            positions_found = 0
-            addresses_found = set()
-            
-            users_data = self._extract_users_data(data)
-            
-            for user_address, user_info in users_data.items():
-                # Validate address format
-                if not is_ethereum_address(user_address):
-                    continue
-                
-                # Skip system addresses
-                if user_address.lower() in SYSTEM_ADDRESSES:
-                    continue
-                
-                # Extract positions for this user
-                positions = self._extract_positions_from_user(user_info)
-                
-                for market, position_data in positions.items():
-                    if market in self.config.target_markets:
-                        position_size = position_data.get('size', 0)
-                        position_value = position_data.get('value', 0)
-                        
-                        # Filter by minimum position size
-                        if (abs(position_size) > 0 and 
-                            position_value >= self.config.min_position_size_usd):
-                            users_by_market[market].add(user_address)
-                            addresses_found.add(user_address)
-                            positions_found += 1
-            
-            logger.info(f"Extracted {positions_found} positions from {len(addresses_found)} addresses")
-            
-            return users_by_market
-
-        except Exception as e:
-            logger.error(f"Error extracting users from snapshot {snapshot_path}: {e}")
-            return {market: set() for market in self.config.target_markets}
-
-    def _extract_users_data(self, data: Any) -> Dict[str, Any]:
-        """
-        Extract user data from the snapshot structure.
-        This handles the complex nested structure of RMP snapshots.
-        """
-        users_data = {}
-        
-        try:
-            # RMP snapshots have a complex structure - try different approaches
-            if isinstance(data, dict):
-                # Try direct user mapping
-                if 'users' in data:
-                    users_data.update(data['users'])
-                
-                # Try state mapping
-                if 'state' in data and isinstance(data['state'], dict):
-                    state = data['state']
-                    if 'users' in state:
-                        users_data.update(state['users'])
-                    
-                    # Sometimes users are under different keys
-                    for key in ['accounts', 'positions', 'user_states']:
-                        if key in state and isinstance(state[key], dict):
-                            users_data.update(state[key])
-                
-                # Try top-level address mappings
-                for key, value in data.items():
-                    if isinstance(key, str) and is_ethereum_address(key):
-                        users_data[key] = value
-                    elif isinstance(value, dict):
-                        # Recursively search for user data
-                        nested_users = self._extract_users_data(value)
-                        users_data.update(nested_users)
-            
-            elif isinstance(data, list):
-                # If data is a list, check each item
-                for item in data:
-                    if isinstance(item, dict):
-                        nested_users = self._extract_users_data(item)
-                        users_data.update(nested_users)
-            
-        except Exception as e:
-            logger.debug(f"Error extracting users data: {e}")
-        
-        return users_data
-
-    def _extract_positions_from_user(self, user_info: Any) -> Dict[str, Dict]:
-        """
-        Extract position information for a specific user.
-        """
-        positions = {}
-        
-        try:
-            if not isinstance(user_info, dict):
-                return positions
-            
-            # Look for position data in various locations
-            position_sources = [
-                user_info.get('positions', {}),
-                user_info.get('assetPositions', {}),
-                user_info.get('perp_positions', {}),
-                user_info
-            ]
-            
-            for source in position_sources:
-                if not isinstance(source, dict):
-                    continue
-                
-                for key, pos_data in source.items():
-                    if not isinstance(pos_data, dict):
-                        continue
-                    
-                    # Try to determine market/coin
-                    market = None
-                    if 'coin' in pos_data:
-                        market = str(pos_data['coin']).upper()
-                    elif 'market' in pos_data:
-                        market = str(pos_data['market']).upper()
-                    elif 'symbol' in pos_data:
-                        market = str(pos_data['symbol']).upper()
-                    elif isinstance(key, str) and key.upper() in self.config.target_markets:
-                        market = key.upper()
-                    
-                    if not market or market not in self.config.target_markets:
-                        continue
-                    
-                    # Extract position size and value
-                    position_size = self._safe_float(pos_data.get('szi', 0))
-                    if position_size == 0:
-                        position_size = self._safe_float(pos_data.get('size', 0))
-                    
-                    # Calculate position value
-                    position_value = self._safe_float(pos_data.get('positionValue', 0))
-                    if position_value == 0:
-                        # Try to calculate from size and price
-                        entry_price = self._safe_float(pos_data.get('entryPx', 0))
-                        mark_price = self._safe_float(pos_data.get('markPx', 0))
-                        price = mark_price or entry_price
-                        if price > 0:
-                            position_value = abs(position_size) * price
-                    
-                    if abs(position_size) > 0:
-                        positions[market] = {
-                            'size': position_size,
-                            'value': position_value,
-                            'raw_data': pos_data
-                        }
-            
-        except Exception as e:
-            logger.debug(f"Error extracting positions from user: {e}")
-        
-        return positions
-
-    def _safe_float(self, value: Any) -> float:
-        """Safely convert value to float."""
-        try:
-            if value is None:
-                return 0.0
-            if isinstance(value, (int, float)):
-                return float(value)
-            if isinstance(value, str):
-                return float(value) if value else 0.0
-            if isinstance(value, Decimal):
-                return float(value)
-            return 0.0
-        except (ValueError, TypeError):
-            return 0.0
-
-    def get_processing_stats(self) -> Dict[str, Any]:
-        """Get processing statistics."""
-        stats = {
-            'total_processed': len(self.processed_snapshots),
-            'successful': len([s for s in self.processed_snapshots.values() if s.status == ProcessingStatus.SUCCESS]),
-            'failed': len([s for s in self.processed_snapshots.values() if s.status == ProcessingStatus.FAILED]),
-            'pending': len([s for s in self.processed_snapshots.values() if s.status == ProcessingStatus.PENDING])
-        }
-        
-        if self.processed_snapshots:
-            latest = max(self.processed_snapshots.values(), key=lambda x: x.processed_at or datetime.min)
-            stats['latest_processed'] = {
-                'path': str(latest.path),
-                'height': latest.height,
-                'processed_at': latest.processed_at.isoformat() if latest.processed_at else None,
-                'status': latest.status.value
-            }
-        
-        return stats
-
-    def cleanup_old_snapshots(self, keep_count: int = None) -> None:
-        """Clean up old processed snapshots from state."""
-        if keep_count is None:
-            keep_count = FileConfig.SNAPSHOT_RETENTION_COUNT
-        
-        if len(self.processed_snapshots) <= keep_count:
-            return
-        
-        # Sort by processed time, keep most recent
-        sorted_snapshots = sorted(
-            self.processed_snapshots.items(),
-            key=lambda x: x[1].processed_at or datetime.min,
-            reverse=True
-        )
-        
-        # Keep only the most recent ones
-        self.processed_snapshots = dict(sorted_snapshots[:keep_count])
-        self._save_state()
-        
-        logger.info(f"Cleaned up old snapshots, kept {len(self.processed_snapshots)} most recent")
+            logger.error(f"Failed to hash file {path}: {e}")
+            return str(path)
 
     async def find_latest_unprocessed_snapshot(self) -> Optional[SnapshotMetadata]:
         """Find the latest unprocessed RMP snapshot."""
@@ -526,88 +156,77 @@ class SnapshotProcessor:
             logger.error(f"Error scanning for snapshots: {e}", exc_info=True)
             return None
 
-    async def extract_positions_from_rmp_direct(
-        self,
-        rmp_path: Path,
-        metadata: SnapshotMetadata
-    ) -> Dict[str, Set[str]]:
-        """
-        DIRECT RMP PROCESSING: Parse MessagePack directly without JSON conversion.
-        Uses the same proven logic as extract_link_from_rmp_direct.py
-        """
+    async def convert_rmp_to_json(self, metadata: SnapshotMetadata) -> Optional[Path]:
+        """Convert RMP to JSON with proper error handling and retries."""
+        if not self.config.node_binary_path.exists():
+            logger.error(f"hl-node binary not found at {self.config.node_binary_path}")
+            return None
 
-        result: Dict[str, Set[str]] = {
-            market: set() for market in self.config.target_markets
-        }
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = self.config.data_dir / f"snapshot_{metadata.height}_{metadata.date}_{timestamp}.json"
 
-        try:
-            logger.info(f"🔄 DIRECT RMP PARSING from {rmp_path}...")
-            logger.info(f"File size: {rmp_path.stat().st_size / (1024*1024):.1f}MB")
+        metadata.status = ProcessingStatus.PROCESSING
+        self.processed_snapshots[metadata.hash] = metadata
 
-            # Load RMP data directly with msgpack
-            with open(rmp_path, 'rb') as f:
-                data = msgpack.unpack(f, raw=False, strict_map_key=False)
+        cmd = [
+            str(self.config.node_binary_path),
+            "--chain", self.config.chain_type,
+            "translate-abci-state",
+            str(metadata.path),
+            str(json_path)
+        ]
 
-            logger.info("✅ Successfully loaded RMP data into memory")
+        logger.info(f"Converting RMP (height: {metadata.height}, size: {metadata.size/1024/1024:.1f}MB)")
 
-            # Derive asset indices and mark prices from this snapshot's universe (NEVER hardcode!)
-            market_to_index, market_to_price = self._derive_asset_indices(data)
+        for attempt in range(3):
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    limit=1024*1024*10
+                )
 
-            if not market_to_index:
-                logger.error("No target markets found in RMP universe")
-                return result
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=300
+                )
 
-            logger.info(f"✓ Derived indices for {len(market_to_index)} markets")
-            logger.info(f"✓ Extracted prices for {len(market_to_price)} markets")
+                if process.returncode != 0:
+                    error_msg = stderr.decode('utf-8', errors='ignore')[:500]
+                    logger.error(f"RMP conversion failed (attempt {attempt+1}): {error_msg}")
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    metadata.status = ProcessingStatus.FAILED
+                    return None
 
-            # System addresses to filter out
-            system_addresses = SYSTEM_ADDRESSES
+                if not json_path.exists() or json_path.stat().st_size < 1000:
+                    logger.error(f"Invalid JSON output: {json_path}")
+                    if json_path.exists():
+                        json_path.unlink()
+                    metadata.status = ProcessingStatus.FAILED
+                    return None
 
-            # Extract positions
-            total_positions_found = 0
-            processed_count = 0
+                json_size_mb = json_path.stat().st_size / 1024 / 1024
+                logger.info(f"Successfully converted to JSON: {json_path.name} ({json_size_mb:.1f}MB)")
 
-            # Navigate to user data
-            if 'exchange' in data and 'perp_dexs' in data['exchange']:
-                for dex in data['exchange']['perp_dexs']:
-                    if 'clearinghouse' in dex and 'user_to_state' in dex['clearinghouse']:
-                        user_to_state = dex['clearinghouse']['user_to_state']
-                        
-                        for address, user_data in user_to_state.items():
-                            if not is_ethereum_address(address) or address.lower() in system_addresses:
-                                continue
+                asyncio.create_task(self._cleanup_old_json_files())
+                return json_path
 
-                            positions_found = self._process_user_positions(
-                                address.lower(), user_data, market_to_index, market_to_price, result
-                            )
-                            total_positions_found += positions_found
-                            processed_count += 1
+            except asyncio.TimeoutError:
+                logger.error(f"RMP conversion timeout (attempt {attempt+1})")
+                if attempt < 2:
+                    await asyncio.sleep(5)
+                    continue
+            except Exception as e:
+                logger.error(f"RMP conversion error: {e}", exc_info=True)
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                    continue
 
-                            if processed_count % 1000 == 0:
-                                logger.info(f"Processed {processed_count} users, found {total_positions_found} positions...")
-
-            # Log results
-            total_unique_addresses = sum(len(addrs) for addrs in result.values())
-            logger.info(f"✅ EXTRACTION COMPLETE")
-            logger.info(f"✓ Found {total_positions_found} active positions")
-            logger.info(f"✓ Found {total_unique_addresses} unique addresses with positions")
-
-            for market, addresses in result.items():
-                if addresses:
-                    logger.info(f"  {market}: {len(addresses)} addresses with active positions")
-
-            # Mark as successful
-            metadata.status = ProcessingStatus.SUCCESS
-            metadata.processed_at = datetime.now()
-            self.processed_snapshots[metadata.hash] = metadata
-            self._save_state()
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Error in RMP extraction: {e}", exc_info=True)
-            metadata.status = ProcessingStatus.FAILED
-            return result
+        metadata.status = ProcessingStatus.FAILED
+        return None
 
     def _derive_asset_indices(self, data: Dict) -> Tuple[Dict[str, int], Dict[str, float]]:
         """
@@ -652,6 +271,666 @@ class SnapshotProcessor:
                         break  # Use first dex with universe
 
         return market_to_index, market_to_price
+
+    async def extract_positions_from_rmp_direct(
+        self,
+        rmp_path: Path,
+        metadata: SnapshotMetadata
+    ) -> Dict[str, Set[str]]:
+        """
+        DIRECT RMP PROCESSING: Parse MessagePack directly without JSON conversion.
+        Uses the same proven logic as extract_link_from_rmp_direct.py
+        """
+
+        result: Dict[str, Set[str]] = {
+            market: set() for market in self.config.target_markets
+        }
+
+        try:
+            logger.info(f"🔄 DIRECT RMP PARSING from {rmp_path}...")
+            logger.info(f"File size: {rmp_path.stat().st_size / (1024*1024):.1f}MB")
+
+            # Load RMP data directly with msgpack
+            with open(rmp_path, 'rb') as f:
+                data = msgpack.unpack(f, raw=False, strict_map_key=False)
+
+            logger.info("✅ Successfully loaded RMP data into memory")
+
+            # Derive asset indices and mark prices from this snapshot's universe (NEVER hardcode!)
+            market_to_index, market_to_price = self._derive_asset_indices(data)
+
+            if not market_to_index:
+                logger.error("No target markets found in universe")
+                return result
+
+            logger.info(f"✓ Derived indices for {len(market_to_index)} markets")
+            logger.info(f"✓ Extracted prices for {len(market_to_price)} markets")
+
+            # Parse clearinghouse state using the SAME logic as working direct parser
+            total_positions_found = 0
+
+            if 'exchange' in data and 'perp_dexs' in data['exchange']:
+                for dex_idx, dex in enumerate(data['exchange']['perp_dexs']):
+                    if 'clearinghouse' not in dex:
+                        continue
+
+                    clearinghouse = dex['clearinghouse']
+
+                    # NEW SCHEMA: user_states (dict format)
+                    if 'user_states' in clearinghouse and isinstance(clearinghouse['user_states'], dict):
+                        logger.info(f"Processing {len(clearinghouse['user_states'])} user_states entries")
+
+                        # FIXED: Check if there's a user_to_state mapping (actual user data)
+                        if 'user_to_state' in clearinghouse['user_states']:
+                            user_to_state = clearinghouse['user_states']['user_to_state']
+                            logger.info(f"Found user_to_state with {len(user_to_state)} users")
+
+                            # user_to_state can be either dict or list of [address, user_data] pairs
+                            if isinstance(user_to_state, dict):
+                                user_items = user_to_state.items()
+                            elif isinstance(user_to_state, list):
+                                user_items = user_to_state
+                            else:
+                                logger.warning(f"Unexpected user_to_state type: {type(user_to_state)}")
+                                user_items = []
+
+                            for item in user_items:
+                                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                                    address, user_data = item[0], item[1]
+                                elif isinstance(user_to_state, dict):
+                                    address, user_data = item  # This is a tuple from .items()
+                                else:
+                                    continue
+
+                                if not is_ethereum_address(address):
+                                    continue
+
+                                address_lower = address.lower()
+                                if address_lower in SYSTEM_ADDRESSES:
+                                    continue
+
+                                # Process positions using the SAME logic as working direct parser
+                                positions_found = self._process_user_positions_direct(
+                                    address_lower, user_data, market_to_index, market_to_price, result
+                                )
+                                total_positions_found += positions_found
+
+                    # LEGACY SCHEMA: books (list format) - same as working direct parser
+                    elif 'books' in clearinghouse and isinstance(clearinghouse['books'], list):
+                        logger.info(f"Processing {len(clearinghouse['books'])} book entries")
+
+                        for book_entry in clearinghouse['books']:
+                            if not (isinstance(book_entry, list) and len(book_entry) >= 2):
+                                continue
+
+                            address, user_data = book_entry[0], book_entry[1]
+
+                            if not is_ethereum_address(address):
+                                continue
+
+                            address_lower = address.lower()
+                            if address_lower in SYSTEM_ADDRESSES:
+                                continue
+
+                            # Process legacy positions
+                            positions_found = self._process_user_positions_direct(
+                                address_lower, user_data, market_to_index, market_to_price, result
+                            )
+                            total_positions_found += positions_found
+
+            # INVARIANT CHECK: Ensure we didn't over-extract
+            total_unique_addresses = sum(len(addrs) for addrs in result.values())
+
+            # This should now be true: unique addresses ≤ total positions
+            if total_unique_addresses > total_positions_found:
+                logger.error(f"INVARIANT VIOLATION: {total_unique_addresses} addresses > {total_positions_found} positions")
+            else:
+                logger.info(f"✅ INVARIANT SATISFIED: {total_unique_addresses} addresses ≤ {total_positions_found} positions")
+
+            # Log results
+            logger.info(f"\n📈 EXTRACTION COMPLETE")
+            logger.info(f"✓ Found {total_positions_found} active positions")
+            logger.info(f"✓ Found {total_unique_addresses} unique addresses with positions")
+
+            for market, addresses in result.items():
+                if addresses:
+                    logger.info(f"  {market}: {len(addresses)} addresses with active positions")
+
+            # Write all addresses to file for debugging
+            all_unique_addresses = set()
+            for market, addresses in result.items():
+                all_unique_addresses.update(addresses)
+
+            debug_file = self.config.data_dir / "active_addresses_found.txt"
+            try:
+                with open(debug_file, 'w') as f:
+                    f.write(f"# Active addresses extracted from snapshot height {metadata.height}\n")
+                    f.write(f"# Total positions: {total_positions_found}\n")
+                    f.write(f"# Unique addresses: {len(all_unique_addresses)}\n")
+                    f.write(f"# Extraction time: {datetime.now().isoformat()}\n\n")
+
+                    for market in sorted(result.keys()):
+                        addresses = result[market]
+                        if addresses:
+                            f.write(f"# {market} ({len(addresses)} addresses)\n")
+                            for address in sorted(addresses):
+                                f.write(f"{market}:{address}\n")
+                            f.write("\n")
+
+                logger.info(f"📝 Wrote {len(all_unique_addresses)} addresses to {debug_file}")
+            except Exception as e:
+                logger.error(f"Failed to write addresses to file: {e}")
+
+            # Mark as successful
+            metadata.status = ProcessingStatus.SUCCESS
+            metadata.processed_at = datetime.now()
+            self.processed_snapshots[metadata.hash] = metadata
+            self._save_state()
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error in direct RMP extraction: {e}", exc_info=True)
+            metadata.status = ProcessingStatus.FAILED
+
+        return result
+
+    def _process_user_positions_direct(
+        self,
+        address: str,
+        user_data: Dict,
+        market_to_index: Dict[str, int],
+        market_to_price: Dict[str, float],
+        result: Dict[str, Set[str]]
+    ) -> int:
+        """
+        Process positions for a single user using DIRECT RMP logic.
+        Uses the same exact logic as extract_link_from_rmp_direct.py
+        """
+        positions_found = 0
+
+        try:
+            # NEW FORMAT: assetPositions with szi (same as direct parser)
+            if 'asset_positions' in user_data and isinstance(user_data['asset_positions'], list):
+                for asset_pos in user_data['asset_positions']:
+                    if isinstance(asset_pos, dict) and 'position' in asset_pos:
+                        position = asset_pos['position']
+                        if isinstance(position, dict):
+                            coin = position.get('coin', '').upper()
+
+                            if coin in market_to_index:
+                                szi_str = position.get('szi', '0')
+                                try:
+                                    szi = Decimal(str(szi_str))
+                                    if szi != 0:
+                                        position_value_usd = self._calculate_position_value_from_snapshot(
+                                            position, float(szi), market_to_price.get(coin, 1.0)
+                                        )
+
+                                        if position_value_usd >= self.config.min_position_size_usd:
+                                            result[coin].add(address)
+                                            positions_found += 1
+                                            logger.debug(f"✓ {coin} position: {address} size={szi} value=${position_value_usd:.2f}")
+                                except (ValueError, TypeError):
+                                    continue
+
+            # LEGACY FORMAT: p.p structure (same as direct parser)
+            elif 'p' in user_data and isinstance(user_data['p'], dict) and 'p' in user_data['p']:
+                positions_list = user_data['p']['p']
+                if isinstance(positions_list, list):
+                    for pos_item in positions_list:
+                        if not (isinstance(pos_item, list) and len(pos_item) >= 2):
+                            continue
+
+                        asset_idx, pos_data = pos_item[0], pos_item[1]
+
+                        # Find which market this index corresponds to
+                        target_market = None
+                        for market, index in market_to_index.items():
+                            if asset_idx == index:
+                                target_market = market
+                                break
+
+                        if target_market and isinstance(pos_data, dict):
+                            size_value = pos_data.get('s') or pos_data.get('sz', '0')
+                            try:
+                                size = Decimal(str(size_value))
+                                if size != 0:
+                                    position_value_usd = self._calculate_position_value_from_snapshot(
+                                        pos_data, float(size), market_to_price.get(target_market, 1.0)
+                                    )
+
+                                    if position_value_usd >= self.config.min_position_size_usd:
+                                        result[target_market].add(address)
+                                        positions_found += 1
+                                        logger.debug(f"✓ {target_market} legacy position: {address} size={size} value=${position_value_usd:.2f}")
+                            except (ValueError, TypeError):
+                                continue
+
+        except Exception as e:
+            logger.debug(f"Error processing positions for {address}: {e}")
+
+        return positions_found
+
+    async def _extract_metadata_chunked(self, json_path: Path) -> Tuple[Dict[str, int], Dict[str, float]]:
+        """
+        Extract metadata (universe, prices) by reading file in chunks.
+        Only keeps the metadata in memory, not the entire JSON structure.
+        """
+        market_to_index = {}
+        market_to_price = {}
+
+        try:
+            logger.info("📖 Reading metadata from JSON file in chunks...")
+
+            # Large chunk size to capture complete arrays efficiently
+            chunk_size = 500 * 1024 * 1024  # 500MB chunks for large universe
+            buffer = ""
+            universe_found = False
+
+            with open(json_path, 'r', encoding='utf-8') as f:
+                while not universe_found:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+
+                    buffer += chunk
+
+                    # Look for universe section
+                    if '"universe":[' in buffer:
+                        logger.info("🎯 Found universe section, extracting...")
+
+                        # Continue reading until we have the complete universe array
+                        start_idx = buffer.find('"universe":[') + 11  # After "universe":[
+
+                        # Make sure we have enough data by continuing to read
+                        while True:
+                            # Count brackets properly, handling nested structures
+                            bracket_count = 1
+                            in_string = False
+                            escape_next = False
+                            end_idx = start_idx
+
+                            while bracket_count > 0 and end_idx < len(buffer):
+                                char = buffer[end_idx]
+
+                                if escape_next:
+                                    escape_next = False
+                                elif char == '\\':
+                                    escape_next = True
+                                elif char == '"' and not escape_next:
+                                    in_string = not in_string
+                                elif not in_string:
+                                    if char == '[':
+                                        bracket_count += 1
+                                    elif char == ']':
+                                        bracket_count -= 1
+
+                                end_idx += 1
+
+                            if bracket_count == 0:
+                                # We found the complete universe array
+                                try:
+                                    universe_json = '[' + buffer[start_idx:end_idx-1] + ']'
+                                    universe = json.loads(universe_json)
+
+                                    logger.info(f"Found universe with {len(universe)} assets")
+
+                                    # Log ALL assets to debug LINK not being found
+                                    for i, asset in enumerate(universe):
+                                        name = asset.get('name', '').upper()
+                                        logger.info(f"Asset {i}: {name}")
+                                        if name in self.config.target_markets:
+                                            market_to_index[name] = i
+                                            logger.info(f"✓✓✓ Found target market {name} at index {i}")
+
+                                    universe_found = True
+                                    break
+                                except json.JSONDecodeError as e:
+                                    logger.error(f"JSON decode error in universe extraction: {e}")
+                                    # Try to read more data
+
+                            # Need more data, read another chunk
+                            more_chunk = f.read(chunk_size)
+                            if not more_chunk:
+                                logger.warning("Reached EOF while looking for universe end")
+                                break
+                            buffer += more_chunk
+
+                    # If we haven't found universe yet, keep reading
+                    if not universe_found and len(buffer) > chunk_size * 3:
+                        # Only keep the last portion to prevent infinite growth
+                        buffer = buffer[-chunk_size:]
+
+                # Now look for asset_ctxs to get prices
+                if market_to_index:
+                    f.seek(0)  # Reset file position
+                    buffer = ""
+                    asset_ctxs_found = False
+
+                    while not asset_ctxs_found:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+
+                        buffer += chunk
+
+                        if '"asset_ctxs":[' in buffer:
+                            logger.info("🎯 Found asset_ctxs section, extracting prices...")
+                            try:
+                                start = buffer.find('"asset_ctxs":[') + 13
+                                bracket_count = 1
+                                end = start
+
+                                while bracket_count > 0 and end < len(buffer):
+                                    if buffer[end] == '[':
+                                        bracket_count += 1
+                                    elif buffer[end] == ']':
+                                        bracket_count -= 1
+                                    end += 1
+
+                                if bracket_count == 0:
+                                    asset_ctxs_json = '[' + buffer[start:end-1] + ']'
+                                    asset_ctxs = json.loads(asset_ctxs_json)
+
+                                    # Extract mark prices
+                                    for market, index in market_to_index.items():
+                                        if index < len(asset_ctxs):
+                                            ctx = asset_ctxs[index]
+                                            if isinstance(ctx, dict) and 'mark_px' in ctx:
+                                                try:
+                                                    price = float(ctx['mark_px'])
+                                                    market_to_price[market] = price
+                                                    logger.info(f"✓ Extracted mark price for {market}: ${price:,.2f}")
+                                                except (ValueError, TypeError):
+                                                    logger.warning(f"Invalid mark_px for {market}: {ctx.get('mark_px')}")
+                                                    market_to_price[market] = 1.0  # Fallback
+
+                                    asset_ctxs_found = True
+                                    break
+                            except json.JSONDecodeError as e:
+                                logger.debug(f"JSON decode error in asset_ctxs extraction: {e}")
+
+                        # Keep only the end of buffer
+                        if len(buffer) > chunk_size * 2:
+                            buffer = buffer[-chunk_size:]
+
+        except Exception as e:
+            logger.error(f"Error extracting metadata: {e}")
+
+        return market_to_index, market_to_price
+
+    async def _extract_positions_chunked(
+        self,
+        json_path: Path,
+        market_to_index: Dict[str, int],
+        market_to_price: Dict[str, float],
+        system_addresses: Set[str],
+        result: Dict[str, Set[str]]
+    ) -> int:
+        """
+        Extract positions by processing the JSON file in chunks.
+        Looks for user_to_state or books sections and processes users incrementally.
+        """
+        total_positions_found = 0
+        processed_count = 0
+
+        try:
+            chunk_size = 500 * 1024 * 1024  # 500MB chunks
+            buffer = ""
+            in_user_section = False
+            user_buffer = ""
+            brace_count = 0
+
+            logger.info("🔄 Streaming positions from JSON file in chunks...")
+
+            with open(json_path, 'r', encoding='utf-8') as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+
+                    buffer += chunk
+
+                    # Look for user_to_state section
+                    if not in_user_section and '"user_to_state":{' in buffer:
+                        logger.info("🎯 Found user_to_state section, processing users...")
+                        in_user_section = True
+                        start_idx = buffer.find('"user_to_state":{') + len('"user_to_state":{')
+                        buffer = '{' + buffer[start_idx:]  # Keep opening brace
+                        brace_count = 1  # Start with 1 for the opening brace
+
+                    if in_user_section:
+                        # Process character by character to find complete user objects
+                        i = 0
+                        while i < len(buffer):
+                            char = buffer[i]
+                            user_buffer += char
+
+                            if char == '{':
+                                brace_count += 1
+                            elif char == '}':
+                                brace_count -= 1
+
+                                # When brace_count hits 0, we have a complete user object
+                                if brace_count == 0 and len(user_buffer.strip()) > 10:
+                                    # Try to extract and process this user
+                                    try:
+                                        # Find the user address (key) and data
+                                        user_entry = user_buffer.strip().rstrip(',')
+                                        if '":' in user_entry:
+                                            addr_end = user_entry.find('":')
+                                            if addr_end > 0:
+                                                address = user_entry[1:addr_end]  # Remove quotes
+                                                user_data_json = user_entry[addr_end + 2:]  # After ":
+
+                                                if is_ethereum_address(address):
+                                                    user_data = json.loads(user_data_json)
+                                                    address_lower = address.lower()
+
+                                                    if address_lower not in system_addresses:
+                                                        positions_found = self._process_user_positions(
+                                                            address_lower, user_data, market_to_index, market_to_price, result
+                                                        )
+                                                        total_positions_found += positions_found
+                                                        processed_count += 1
+
+                                                        if processed_count % 1000 == 0:
+                                                            logger.info(f"Processed {processed_count} users, found {total_positions_found} positions...")
+                                    except (json.JSONDecodeError, KeyError, ValueError) as e:
+                                        logger.debug(f"Error processing user entry: {e}")
+
+                                    user_buffer = ""  # Reset for next user
+
+                            i += 1
+
+                        # Keep the processed part, remove what we've analyzed
+                        buffer = buffer[i:]
+
+                    # Prevent buffer from growing too large
+                    if not in_user_section and len(buffer) > chunk_size * 3:
+                        buffer = buffer[-chunk_size:]  # Keep last chunk for boundaries
+
+        except Exception as e:
+            logger.error(f"Error in chunked position extraction: {e}")
+
+        logger.info(f"📊 Processed {processed_count} users total")
+        return total_positions_found
+
+    def _process_user_positions(
+        self,
+        address: str,
+        user_data: Dict,
+        market_to_index: Dict[str, int],
+        market_to_price: Dict[str, float],
+        result: Dict[str, Set[str]]
+    ) -> int:
+        """
+        Process positions for a single user, handling both new and legacy formats.
+        Returns the number of positions found for this user.
+        """
+        positions_found = 0
+
+        try:
+            # NEW FORMAT: assetPositions with szi
+            if 'asset_positions' in user_data:
+                for asset_pos in user_data['asset_positions']:
+                    position = asset_pos.get('position', {})
+                    coin = position.get('coin', '').upper()
+
+                    if coin in market_to_index:
+                        szi_str = position.get('szi', '0')
+                        try:
+                            szi = Decimal(str(szi_str))
+                            if szi != 0:
+                                position_value_usd = self._calculate_position_value_from_snapshot(
+                                    position, float(szi), market_to_price.get(coin, 1.0)
+                                )
+
+                                if position_value_usd >= self.config.min_position_size_usd:
+                                    result[coin].add(address)
+                                    positions_found += 1
+                        except (ValueError, TypeError):
+                            continue
+
+            # LEGACY FORMAT: p.p structure
+            elif 'p' in user_data and isinstance(user_data['p'], dict) and 'p' in user_data['p']:
+                positions_list = user_data['p']['p']
+                if isinstance(positions_list, list):
+                    for pos_item in positions_list:
+                        if not (isinstance(pos_item, list) and len(pos_item) >= 2):
+                            continue
+
+                        asset_idx, pos_data = pos_item[0], pos_item[1]
+
+                        # Find which market this index corresponds to
+                        target_market = None
+                        for market, index in market_to_index.items():
+                            if asset_idx == index:
+                                target_market = market
+                                break
+
+                        if target_market and isinstance(pos_data, dict):
+                            size_value = pos_data.get('s') or pos_data.get('sz', '0')
+                            try:
+                                size = Decimal(str(size_value))
+                                if size != 0:
+                                    position_value_usd = self._calculate_position_value_from_snapshot(
+                                        pos_data, float(size), market_to_price.get(target_market, 1.0)
+                                    )
+
+                                    if position_value_usd >= self.config.min_position_size_usd:
+                                        result[target_market].add(address)
+                                        positions_found += 1
+                            except (ValueError, TypeError):
+                                continue
+
+        except Exception as e:
+            logger.debug(f"Error processing positions for {address}: {e}")
+
+        return positions_found
+
+    async def extract_positions_from_json(
+        self,
+        json_path: Path,
+        metadata: SnapshotMetadata
+    ) -> Dict[str, Set[str]]:
+        """
+        FIXED VERSION: Use proper JSON parsing instead of regex.
+        Ensures unique addresses = users with active positions.
+        """
+
+        result: Dict[str, Set[str]] = {
+            market: set() for market in self.config.target_markets
+        }
+
+        try:
+            logger.info(f"🔄 CHUNKED STREAMING PARSE from {json_path}...")
+            logger.info(f"File size: {json_path.stat().st_size / (1024*1024):.1f}MB")
+
+            # Extract metadata using chunked reading to avoid memory issues
+            market_to_index, market_to_price = await self._extract_metadata_chunked(json_path)
+
+            if not market_to_index:
+                logger.error("No target markets found in universe")
+                return result
+
+            logger.info(f"✓ Derived indices for {len(market_to_index)} markets")
+            logger.info(f"✓ Extracted prices for {len(market_to_price)} markets")
+
+            # System addresses to filter out
+            system_addresses = {
+                '0x0000000000000000000000000000000000000000',
+                '0x0000000000000000000000000000000000000001',
+                '0x000000000000000000000000000000000000dead',
+                '0xffffffffffffffffffffffffffffffffffffffff'
+            }
+
+            # Parse positions using chunked streaming to avoid memory issues
+            total_positions_found = await self._extract_positions_chunked(
+                json_path, market_to_index, market_to_price, system_addresses, result
+            )
+
+            # INVARIANT CHECK: Ensure we didn't over-extract
+            total_unique_addresses = sum(len(addrs) for addrs in result.values())
+
+            # This should now be true: unique addresses ≤ total positions
+            if total_unique_addresses > total_positions_found:
+                logger.error(f"INVARIANT VIOLATION: {total_unique_addresses} addresses > {total_positions_found} positions")
+                # This indicates a bug in the extraction logic
+            else:
+                logger.info(f"✅ INVARIANT SATISFIED: {total_unique_addresses} addresses ≤ {total_positions_found} positions")
+
+            # Log results
+            logger.info(f"\n📈 EXTRACTION COMPLETE")
+            logger.info(f"✓ Found {total_positions_found} active positions")
+            logger.info(f"✓ Found {total_unique_addresses} unique addresses with positions")
+
+            for market, addresses in result.items():
+                if addresses:
+                    logger.info(f"  {market}: {len(addresses)} addresses with active positions")
+
+            # Write all addresses to file for debugging
+            all_unique_addresses = set()
+            for market, addresses in result.items():
+                all_unique_addresses.update(addresses)
+
+            lol_file = self.config.data_dir / "active_addresses_found.txt"
+            try:
+                with open(lol_file, 'w') as f:
+                    f.write(f"# Active addresses extracted from snapshot height {metadata.height}\n")
+                    f.write(f"# Total positions: {total_positions_found}\n")
+                    f.write(f"# Unique addresses: {len(all_unique_addresses)}\n")
+                    f.write(f"# Extraction time: {datetime.now().isoformat()}\n\n")
+
+                    for market in sorted(result.keys()):
+                        addresses = result[market]
+                        if addresses:
+                            f.write(f"# {market} ({len(addresses)} addresses)\n")
+                            for address in sorted(addresses):
+                                f.write(f"{market}:{address}\n")
+                            f.write("\n")
+
+                logger.info(f"📝 Wrote {len(all_unique_addresses)} addresses to {lol_file}")
+            except Exception as e:
+                logger.error(f"Failed to write addresses to file: {e}")
+
+            # Mark as successful
+            metadata.status = ProcessingStatus.SUCCESS
+            metadata.processed_at = datetime.now()
+            self.processed_snapshots[metadata.hash] = metadata
+            self._save_state()
+
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing failed: {e}")
+            metadata.status = ProcessingStatus.FAILED
+        except Exception as e:
+            logger.error(f"Error in extraction: {e}", exc_info=True)
+            metadata.status = ProcessingStatus.FAILED
+
+        return result
 
     def _calculate_position_value_from_snapshot(
         self,
@@ -737,3 +1016,35 @@ class SnapshotProcessor:
                         logger.warning(f"Could not delete {old_file}: {e}")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
+
+    async def process_latest_snapshot(self) -> Tuple[bool, Dict[str, Set[str]]]:
+        """
+        Main entry point for processing snapshots.
+        Returns: (success, {market: {addresses}})
+        """
+        async with self.processing_lock:
+            metadata = await self.find_latest_unprocessed_snapshot()
+            if not metadata:
+                logger.debug("No new snapshots to process")
+                return False, {}
+
+            logger.info(f"Processing snapshot: height={metadata.height} date={metadata.date}")
+
+            try:
+                # DIRECT RMP PROCESSING - no JSON conversion needed!
+                positions = await self.extract_positions_from_rmp_direct(metadata.path, metadata)
+                return True, positions
+
+            except Exception as e:
+                logger.error(f"Failed to process RMP snapshot {metadata.path}: {e}")
+                metadata.status = ProcessingStatus.FAILED
+                return False, {}
+
+    async def _delayed_cleanup(self, path: Path, delay: int) -> None:
+        """Delete file after delay."""
+        await asyncio.sleep(delay)
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass

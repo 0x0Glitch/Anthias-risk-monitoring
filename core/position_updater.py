@@ -317,6 +317,102 @@ class PositionUpdater:
 
         return positions
 
+    # REMOVED: _calculate_liquidation_price method - using API values only
+
+    def _get_maintenance_leverage(self, position_value: float, coin: str) -> float:
+        """
+        Get maintenance leverage based on position value and margin tiers.
+
+        Based on Hyperliquid's actual margin tier system.
+        For assets with margin tiers, maintenance leverage depends on the
+        position value at the liquidation price.
+        """
+
+        # Hyperliquid-style margin tiers (maintenance leverage values)
+        # These are approximations based on typical DeFi perp exchange values
+        tiers = {}
+
+        # Get tiers for this coin, default to DEFAULT
+        coin_tiers = tiers.get(coin, tiers['DEFAULT'])
+
+        # Find appropriate tier (use reversed to find highest matching tier)
+        for threshold, maintenance_leverage in reversed(coin_tiers):
+            if position_value >= threshold:
+                return maintenance_leverage
+
+        # Fallback to most conservative tier
+        return coin_tiers[0][1]
+
+    def _get_maintenance_margin_rate(self, position_value: float, coin: str) -> float:
+        """
+        Get maintenance margin rate based on position value and asset.
+
+        Maintenance margin rate determines how close to liquidation a position can get.
+        Typical values:
+        - Major assets (BTC, ETH): 3-5%
+        - Altcoins: 5-10%
+        - Small positions: Lower rates
+        - Large positions: Higher rates (risk tiers)
+        """
+
+        # Risk tiers based on position size
+        if position_value < 10_000:  # Small positions
+            base_rate = 0.03  # 3%
+        elif position_value < 50_000:  # Medium positions
+            base_rate = 0.05  # 5%
+        elif position_value < 200_000:  # Large positions
+            base_rate = 0.08  # 8%
+        else:  # Very large positions
+            base_rate = 0.12  # 12%
+
+        # Asset-specific adjustments
+        if coin in ['BTC', 'ETH']:
+            # Major assets get lower maintenance margin
+            return base_rate * 0.8
+        elif coin in ['LINK', 'SOL', 'AVAX', 'MATIC']:
+            # Popular altcoins
+            return base_rate
+        else:
+            # Other assets get higher maintenance margin
+            return base_rate * 1.2
+
+    async def _fetch_mark_prices(self) -> Dict[str, float]:
+        """Fetch current mark prices from local node or public API."""
+        try:
+            # Try local node info server first (if available)
+            if hasattr(self.config, 'local_node_url'):
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                    payload = {"type": "activeAssetData"}
+                    async with session.post(f"{self.config.local_node_url}/info", json=payload) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            mark_prices = {}
+                            for asset_data in data:
+                                coin = asset_data.get('coin', '').upper()
+                                mark_px = float(asset_data.get('markPx', 0))
+                                if coin and mark_px > 0:
+                                    mark_prices[coin] = mark_px
+                            return mark_prices
+        except Exception as e:
+            logger.debug(f"Failed to fetch mark prices from local node: {e}")
+
+        # Fallback to public API or return empty dict
+        return {}
+
+    async def _fetch_margin_table(self) -> Dict[str, List]:
+        """Fetch margin tier table from local node."""
+        try:
+            if hasattr(self.config, 'local_node_url'):
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                    payload = {"type": "marginTable"}
+                    async with session.post(f"{self.config.local_node_url}/info", json=payload) as response:
+                        if response.status == 200:
+                            return await response.json()
+        except Exception as e:
+            logger.debug(f"Failed to fetch margin table from local node: {e}")
+
+        return {}
+
     async def _query_clearinghouse_state(
         self,
         address: str,
@@ -385,7 +481,7 @@ class PositionUpdater:
         self,
         positions: Dict[str, Dict[str, Dict]]
     ):
-        """Store positions using batch insert for maximum efficiency."""
+        """OPTIMIZED: Store positions using COPY for maximum efficiency."""
         if not positions:
             return
 
@@ -393,6 +489,8 @@ class PositionUpdater:
             # Get database pool from manager
             if not hasattr(self.db, 'pool') or self.db.pool is None:
                 logger.error("Database pool is None - cannot store positions")
+                logger.error(f"Database manager type: {type(self.db)}")
+                logger.error(f"Database manager attributes: {dir(self.db)}")
                 return
 
             async with self.db.pool.acquire() as conn:
@@ -427,7 +525,7 @@ class PositionUpdater:
                                 continue  # Skip zero positions
 
                             # Map position data to database fields - handle None values properly
-                            def safe_float_db(value, default=0.0):
+                            def safe_float(value, default=0.0):
                                 """Safely convert to float, handling None values."""
                                 if value is None:
                                     return default if default is not None else None
@@ -436,7 +534,7 @@ class PositionUpdater:
                                 except (ValueError, TypeError):
                                     return default if default is not None else None
 
-                            def safe_int_db(value, default=None):
+                            def safe_int(value, default=None):
                                 """Safely convert to int, handling None values."""
                                 if value is None:
                                     return default
@@ -449,22 +547,22 @@ class PositionUpdater:
                                 address.lower(),  # address VARCHAR(42)
                                 market.upper(),   # market VARCHAR(20)
                                 position_size,    # position_size NUMERIC(20, 8)
-                                safe_float_db(pos.get('entry_price'), None),  # entry_price NUMERIC(20, 8)
-                                safe_float_db(pos.get('liquidation_price'), None),  # liquidation_price NUMERIC(20, 8)
-                                safe_float_db(pos.get('margin_used'), 0.0),  # margin_used NUMERIC(20, 8)
-                                safe_float_db(pos.get('position_value'), 0.0),  # position_value NUMERIC(20, 8)
-                                safe_float_db(pos.get('unrealized_pnl'), 0.0),  # unrealized_pnl NUMERIC(20, 8)
-                                safe_float_db(pos.get('return_on_equity'), None),  # return_on_equity NUMERIC(10, 6)
+                                safe_float(pos.get('entry_price'), None),  # entry_price NUMERIC(20, 8)
+                                safe_float(pos.get('liquidation_price'), None),  # liquidation_price NUMERIC(20, 8)
+                                safe_float(pos.get('margin_used'), 0.0),  # margin_used NUMERIC(20, 8)
+                                safe_float(pos.get('position_value'), 0.0),  # position_value NUMERIC(20, 8)
+                                safe_float(pos.get('unrealized_pnl'), 0.0),  # unrealized_pnl NUMERIC(20, 8)
+                                safe_float(pos.get('return_on_equity'), None),  # return_on_equity NUMERIC(10, 6)
                                 pos.get('leverage', {}).get('type', 'cross'),  # leverage_type VARCHAR(10)
-                                safe_int_db(pos.get('leverage', {}).get('value'), None),  # leverage_value INTEGER
-                                safe_float_db(pos.get('leverage', {}).get('rawUsd'), 0.0),  # leverage_raw_usd NUMERIC(20, 8)
-                                safe_float_db(pos.get('account_value'), 0.0),  # account_value NUMERIC(20, 8)
-                                safe_float_db(pos.get('total_margin_used'), 0.0),  # total_margin_used NUMERIC(20, 8)
-                                safe_float_db(pos.get('withdrawable'), 0.0),  # withdrawable NUMERIC(20, 8)
+                                safe_int(pos.get('leverage', {}).get('value'), None),  # leverage_value INTEGER
+                                safe_float(pos.get('leverage', {}).get('rawUsd'), 0.0),  # leverage_raw_usd NUMERIC(20, 8)
+                                safe_float(pos.get('account_value'), 0.0),  # account_value NUMERIC(20, 8)
+                                safe_float(pos.get('total_margin_used'), 0.0),  # total_margin_used NUMERIC(20, 8)
+                                safe_float(pos.get('withdrawable'), 0.0),  # withdrawable NUMERIC(20, 8)
                                 datetime.now()  # last_updated TIMESTAMP
                             ))
 
-                    # Use batch insert for fastest insertion
+                    # Use COPY for fastest insertion
                     if records:
                         # Insert in smaller chunks
                         chunk_size = 500
@@ -503,6 +601,37 @@ class PositionUpdater:
             logger.error(f"Database write failed: {e}")
             # Continue anyway - don't crash the whole process
 
+    async def check_removal_candidates(
+        self,
+        removal_candidates: Dict[str, Set[str]]
+    ) -> Dict[str, Set[str]]:
+        """
+        Check removal candidates for closed positions (dual-check).
+
+        Args:
+            removal_candidates: Dictionary of market -> addresses to check
+
+        Returns:
+            Dictionary of market -> addresses with confirmed closed positions
+        """
+
+        closed_positions = {market: set() for market in self.config.target_markets}
+
+        for market, addresses in removal_candidates.items():
+            if not addresses:
+                continue
+
+            logger.info(f"Checking {len(addresses)} {market} removal candidates")
+
+            for address in addresses:
+                positions = await self._get_user_positions(address, [market])
+
+                # Check if position is closed or doesn't exist
+                if not positions or not positions.get(market) or positions.get(market, {}).get('closed', False):
+                    closed_positions[market].add(address)
+
+        return closed_positions
+    
     def get_stats(self) -> Dict[str, int]:
         """Get API query statistics."""
         return self.api_stats.copy()
