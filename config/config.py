@@ -41,7 +41,7 @@ class MonitorConfig:
     # Processing intervals (seconds)
     snapshot_check_interval: int = 120  # Check for new snapshots every 2 minutes
     position_refresh_interval: int = 10  # Refresh positions every 10 seconds
-    position_refresh_batch_size: int = 50  # Process 50 addresses per batch
+    position_refresh_batch_size: int = 500  # Process 50 addresses per batch
     
     # Worker settings
     max_workers: int = 10
@@ -88,7 +88,7 @@ class MonitorConfig:
         config = cls(
             database_url=database_url,
             target_markets=target_markets,
-            min_position_size_usd=float(os.getenv("MIN_POSITION_SIZE_USD", "10000")),
+            min_position_size_usd=float(os.getenv("MIN_POSITION_SIZE_USD", "0")),
             rmp_base_path=rmp_base_path,
             node_binary_path=node_binary_path,
             snapshots_dir=snapshots_dir,
@@ -98,9 +98,9 @@ class MonitorConfig:
             nvn_api_url=nvn_api_url,
             public_api_url=public_api_url,
             api_timeout=int(os.getenv("API_TIMEOUT", "10")),
-            snapshot_check_interval=int(os.getenv("SNAPSHOT_CHECK_INTERVAL", "60")),
+            snapshot_check_interval=int(os.getenv("SNAPSHOT_CHECK_INTERVAL", "120")),
             position_refresh_interval=int(os.getenv("POSITION_REFRESH_INTERVAL", "10")),
-            position_refresh_batch_size=int(os.getenv("POSITION_REFRESH_BATCH_SIZE", "50")),
+            position_refresh_batch_size=int(os.getenv("POSITION_REFRESH_BATCH_SIZE", "500")),
             max_workers=int(os.getenv("MAX_WORKERS", "10")),
             max_retries=int(os.getenv("MAX_RETRIES", "3")),
             retry_delay=float(os.getenv("RETRY_DELAY", "1.0")),
