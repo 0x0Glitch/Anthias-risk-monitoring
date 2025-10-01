@@ -391,40 +391,13 @@ class SnapshotProcessor:
             logger.info(f"\n📈 EXTRACTION COMPLETE")
             logger.info(f"✓ Found {total_positions_found} active positions")
             logger.info(f"✓ Found {total_unique_addresses} unique addresses with positions")
-
-            for market, addresses in result.items():
-                if addresses:
-                    logger.info(f"  {market}: {len(addresses)} addresses with active positions")
-
-            # Write all addresses to file for debugging
-            all_unique_addresses = set()
-            for market, addresses in result.items():
-                all_unique_addresses.update(addresses)
-
-            debug_file = self.config.data_dir / "active_addresses_found.txt"
-            try:
-                with open(debug_file, 'w') as f:
-                    f.write(f"# Active addresses extracted from snapshot height {metadata.height}\n")
-                    f.write(f"# Total positions: {total_positions_found}\n")
-                    f.write(f"# Unique addresses: {len(all_unique_addresses)}\n")
-                    f.write(f"# Extraction time: {datetime.now().isoformat()}\n\n")
-
-                    for market in sorted(result.keys()):
-                        addresses = result[market]
-                        if addresses:
-                            f.write(f"# {market} ({len(addresses)} addresses)\n")
-                            for address in sorted(addresses):
-                                f.write(f"{market}:{address}\n")
-                            f.write("\n")
-
-                logger.info(f"📝 Wrote {len(all_unique_addresses)} addresses to {debug_file}")
-            except Exception as e:
-                logger.error(f"Failed to write addresses to file: {e}")
+            logger.info(f"📊 Addresses distributed across {len(result)} markets")
 
             # Mark as successful
             metadata.status = ProcessingStatus.SUCCESS
             metadata.processed_at = datetime.now()
             self.processed_snapshots[metadata.hash] = metadata
+
             self._save_state()
 
             return result
@@ -1047,4 +1020,4 @@ class SnapshotProcessor:
             if path.exists():
                 path.unlink()
         except Exception:
-            pass
+            passc

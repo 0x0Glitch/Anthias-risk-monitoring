@@ -42,11 +42,11 @@ class DatabaseConfig:
     MIN_POOL_SIZE = 5
     MAX_POOL_SIZE = 20
     COMMAND_TIMEOUT = 60  # seconds
-    
+
     # Batch processing
     MAX_BATCH_SIZE = 100
     INSERT_CHUNK_SIZE = 500
-    
+
     # Cleanup thresholds
     CLOSED_POSITION_MAX_AGE_HOURS = 24
     STALE_POSITION_MAX_AGE_HOURS = 168  # 1 week
@@ -62,12 +62,12 @@ class APIConfig:
     DEFAULT_HTTP_CONCURRENCY = 5
     API_CALL_DELAY = 0.1  # seconds between calls
     RETRY_BACKOFF_SEC = 0.5
-    
+
     # Batch sizes
     POSITION_BATCH_SIZE = 500
     BATCH_TIMEOUT = 30.0  # seconds
     BATCH_DELAY = 0.5  # seconds between batches
-    
+
     # Error handling
     BATCH_ERROR_DELAY = 2.0  # seconds after batch errors
 
@@ -95,7 +95,7 @@ class FileConfig:
     # Snapshot retention
     MAX_SNAPSHOT_CACHE_SIZE = 100
     SNAPSHOT_RETENTION_COUNT = 2  # Keep only 2 latest JSON snapshots
-    
+
     # File operations
     FILE_READ_CHUNK_SIZE = 500 * 1024 * 1024  # 500MB chunks
     HASH_BLOCK_SIZE = 4096  # bytes for hashing
@@ -110,7 +110,7 @@ class LogConfig:
     # File sizes
     MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB
     MAX_ERROR_LOG_SIZE = 5 * 1024 * 1024  # 5MB
-    
+
     # Backup counts
     LOG_BACKUP_COUNT = 5
     ERROR_LOG_BACKUP_COUNT = 3
@@ -126,7 +126,7 @@ class MonitoringThresholds:
     MAX_CONSECUTIVE_ERRORS = 5
     MAX_TASK_ERRORS = 10
     MAX_DEGRADED_COMPONENTS = 2
-    
+
     # Timeouts
     CONVERSION_TIMEOUT = 300  # seconds for RMP conversion
     SUBPROCESS_BUFFER_LIMIT = 1024 * 1024 * 10  # 10MB

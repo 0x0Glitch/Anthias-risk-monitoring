@@ -61,7 +61,7 @@ class PositionUpdater:
         """
 
         all_positions = {}
-        
+
         if not addresses_by_market:
             logger.info("No addresses to update")
             return {}
@@ -70,7 +70,7 @@ class PositionUpdater:
         total_unique_addresses = set()
         for addresses in addresses_by_market.values():
             total_unique_addresses.update(addresses)
-        
+
         total_addresses = len(total_unique_addresses)
         total_markets = len(addresses_by_market)
 
@@ -100,59 +100,128 @@ class PositionUpdater:
             logger.info(f"Addresses in {market}: {len(addresses)}")
             logger.info("=" * 60)
 
-            # Process this market
+            # Process this market completely before moving to next
             market_positions, market_stats = await self._process_market_addresses(market, list(addresses))
-            
+
+            # Wait for all database operations to complete before counting
+            await asyncio.sleep(0.5)
+
+            # ENHANCED VERIFICATION: Check database count after processing
+            actual_db_count = await self.db.queries.get_positions_count(market.lower())
+            expected_count = len(market_positions)
+
+            if actual_db_count != expected_count:
+                logger.error(f"❌ {market} COUNT MISMATCH:")
+                logger.error(f"   Expected: {expected_count} positions")
+                logger.error(f"   Database: {actual_db_count} positions")
+                logger.error(f"   Difference: {actual_db_count - expected_count:+d}")
+
+                # DEBUG: Get sample of addresses in DB for debugging
+                db_addresses = await self.db.queries.get_all_addresses_in_market(market.lower())
+                processed_addresses = set(market_positions.keys())
+
+                # Find addresses in DB but not in processed set
+                extra_in_db = [addr for addr in db_addresses if addr not in processed_addresses]
+                missing_from_db = [addr for addr in processed_addresses if addr not in db_addresses]
+
+                if extra_in_db:
+                    logger.error(f"   🔍 Extra addresses in DB: {extra_in_db[:3]}... ({len(extra_in_db)} total)")
+                    # IMMEDIATE FIX: Remove extra addresses
+                    logger.warning(f"   🗑️ Removing {len(extra_in_db)} extra addresses from database...")
+                    await self.db.queries.bulk_remove_addresses(market.lower(), extra_in_db)
+                    logger.info(f"   ✅ Removed {len(extra_in_db)} extra addresses")
+
+                if missing_from_db:
+                    logger.error(f"   🔍 Missing from DB: {missing_from_db[:3]}... ({len(missing_from_db)} total)")
+                    # CRITICAL FIX: Re-process missing addresses to add them back
+                    logger.warning(f"   ➕ Re-processing {len(missing_from_db)} missing addresses...")
+
+                    # Get positions for missing addresses
+                    missing_positions = {}
+                    for addr in missing_from_db:
+                        if addr in market_positions:
+                            missing_positions[addr] = {market: market_positions[addr]}
+
+                    if missing_positions:
+                        # Force upsert the missing positions
+                        missing_records = []
+                        for addr, pos_data in missing_positions.items():
+                            pos = pos_data[market]
+                            missing_records.append({
+                                'address': addr.lower(),
+                                'market': market.upper(),
+                                'position_size': float(pos.get('position_size', 0)),
+                                'entry_price': float(pos.get('entry_price', 0)),
+                                'liquidation_price': float(pos.get('liquidation_price', 0)),
+                                'margin_used': float(pos.get('margin_used', 0)),
+                                'position_value': float(pos.get('position_value', 0)),
+                                'unrealized_pnl': float(pos.get('unrealized_pnl', 0)),
+                                'return_on_equity': float(pos.get('return_on_equity', 0)),
+                                'leverage_type': pos.get('leverage', {}).get('type', 'cross'),
+                                'leverage_value': int(pos.get('leverage', {}).get('value', 0)) if pos.get('leverage', {}).get('value') else None,
+                                'leverage_raw_usd': float(pos.get('leverage', {}).get('rawUsd', 0)),
+                                'account_value': float(pos.get('account_value', 0)),
+                                'total_margin_used': float(pos.get('total_margin_used', 0)),
+                                'withdrawable': float(pos.get('withdrawable', 0))
+                            })
+
+                        await self.db.queries.upsert_positions(market.lower(), missing_records)
+                        logger.info(f"   ✅ Added {len(missing_records)} missing positions to database")
+
+                        # Verify the fix worked
+                        await asyncio.sleep(0.2)  # Allow DB to commit
+                        final_db_count = await self.db.queries.get_positions_count(market.lower())
+                        if final_db_count == expected_count:
+                            logger.info(f"   🎯 FIXED: Database now has {final_db_count} positions (perfect match!)")
+                        else:
+                            logger.error(f"   ❌ STILL BROKEN: Database has {final_db_count}, expected {expected_count}")
+            else:
+                logger.info(f"✅ {market} COUNT VERIFIED: {actual_db_count} positions match expected")
+
             # Merge results
             all_positions.update(market_positions)
-            
+
             # Update overall stats
             overall_stats['successful_addresses'] += market_stats['successful']
             overall_stats['total_api_failures'] += market_stats['failures']
             overall_stats['total_no_positions'] += market_stats['no_positions']
             overall_stats['total_positions_found'] += market_stats['positions_found']
 
-            logger.info(f"✅ {market} complete: {market_stats['successful']} with positions, "
-                       f"{market_stats['no_positions']} no positions, {market_stats['failures']} failures")
-            
-            # Brief pause between markets
+            logger.info(f"✅ {market} complete: {market_stats['successful']} addresses with {expected_count} positions")
+            logger.info(f"📊 {market} database verified: {actual_db_count} positions")
+
+            # Longer pause between markets to ensure complete isolation
             if market_num < total_markets:
-                await asyncio.sleep(1)
+                logger.info("⏳ Waiting 2 seconds before processing next market...")
+                await asyncio.sleep(2)
 
         # Final overall summary
         logger.info("=" * 80)
         logger.info("MULTI-MARKET UPDATE SUMMARY")
         logger.info(f"Markets processed: {total_markets}")
-        logger.info(f"Total unique addresses: {total_addresses}")
         logger.info(f"✓ Addresses with positions: {overall_stats['successful_addresses']}")
         logger.info(f"⚪ Addresses with no positions: {overall_stats['total_no_positions']}")
         logger.info(f"❌ API failures: {overall_stats['total_api_failures']}")
         logger.info(f"📊 Total positions found: {overall_stats['total_positions_found']}")
-        
-        success_rate = (overall_stats['successful_addresses'] / total_addresses * 100) if total_addresses else 0.0
-        avg_positions = (overall_stats['total_positions_found'] / overall_stats['successful_addresses']) if overall_stats['successful_addresses'] > 0 else 0.0
-        logger.info(f"Overall success rate: {success_rate:.1f}%")
-        logger.info(f"Avg positions per successful address: {avg_positions:.1f}")
-        logger.info("=" * 80)
 
         return all_positions
-    
+
     async def _process_market_addresses(self, market: str, addresses: List[str]) -> tuple[Dict[str, Dict], Dict[str, int]]:
         """
         Process addresses for a specific market with batch processing.
-        
+
         Args:
-            market: Market name (e.g., 'BTC', 'ETH', 'LINK')  
+            market: Market name (e.g., 'BTC', 'ETH', 'LINK')
             addresses: List of addresses to process for this market
-            
+
         Returns:
             Tuple of (market_positions, market_stats)
         """
-        
+
         market_positions = {}
-        batch_size = APIConfig.POSITION_BATCH_SIZE
+        batch_size = self.config.position_refresh_batch_size
         total_batches = (len(addresses) + batch_size - 1) // batch_size
-        
+
         # Counters for this market
         successful_addresses = 0
         api_failures = 0
@@ -165,11 +234,12 @@ class PositionUpdater:
             batch_addresses = addresses[start_idx:end_idx]
 
             logger.info(f"  🔄 {market} batch {batch_num + 1}/{total_batches} ({len(batch_addresses)} addresses)")
+            logger.debug(f"    📋 Batch {batch_num + 1} addresses: {start_idx}-{end_idx-1}")
 
             try:
                 # Create address to markets mapping for this specific market
                 address_to_markets = {addr: [market] for addr in batch_addresses}
-                
+
                 # Process batch of addresses
                 batch_results = await self._get_batch_positions(batch_addresses, address_to_markets)
 
@@ -187,9 +257,13 @@ class PositionUpdater:
                         successful_addresses += 1
                         logger.debug(f"    ✓ {address}: {positions_count} positions")
 
-                # Store batch results
-                if batch_results:
-                    await self._store_positions(batch_results)
+                # Store batch results - pass ALL batch addresses for proper cleanup
+                logger.debug(f"    💾 Storing {len(batch_results)} address results to database...")
+                await self._store_positions(batch_results, market, batch_addresses)
+
+                # Ensure database write is fully committed before continuing
+                await asyncio.sleep(0.2)  # Longer delay to ensure write completion
+                logger.debug(f"    ✅ Database write completed")
 
                 # Progress update for this market
                 total_processed = successful_addresses + api_failures + no_positions
@@ -201,7 +275,8 @@ class PositionUpdater:
                 await asyncio.sleep(APIConfig.BATCH_DELAY)
 
             except Exception as e:
-                logger.error(f"    Failed to process {market} batch {batch_num + 1}: {e}")
+                logger.error(f"    ❌ FAILED to process {market} batch {batch_num + 1}/{total_batches}: {e}")
+                logger.error(f"    ⏭️  Skipping {len(batch_addresses)} addresses and continuing to next batch...")
                 api_failures += len(batch_addresses)
                 await asyncio.sleep(APIConfig.BATCH_ERROR_DELAY)
                 continue
@@ -212,8 +287,19 @@ class PositionUpdater:
             'no_positions': no_positions,
             'positions_found': positions_found
         }
-        
+
         return market_positions, market_stats
+
+    async def _verify_market_positions_count(self, market: str) -> int:
+        """Verify the actual count of positions in the database for a specific market."""
+        try:
+            # Query database to get actual count
+            token = market.lower()
+            count = await self.db.queries.get_positions_count(token)
+            return count
+        except Exception as e:
+            logger.error(f"Failed to verify positions count for {market}: {e}")
+            return -1
 
     async def _get_batch_positions(
         self,
@@ -536,105 +622,265 @@ class PositionUpdater:
 
     async def _store_positions(
         self,
-        positions: Dict[str, Dict[str, Dict]]
+        positions: Dict[str, Dict[str, Dict]],
+        market: str,
+        all_batch_addresses: List[str]
     ):
-        """OPTIMIZED: Store positions using COPY for maximum efficiency."""
-        if not positions:
+        """
+        CRITICAL FIX: Properly handle both active and closed positions.
+
+        - Addresses WITH positions → UPSERT
+        - Addresses WITH NO/CLOSED positions → DELETE from DB
+        - API failures → Skip (don't touch DB)
+
+        Args:
+            positions: Dict of address -> positions data (None = API failure, {} = no positions)
+            market: The market being processed
+            all_batch_addresses: ALL addresses in this batch
+        """
+        if not all_batch_addresses:
             return
 
         try:
             # Get database pool from manager
             if not hasattr(self.db, 'pool') or self.db.pool is None:
                 logger.error("Database pool is None - cannot store positions")
-                logger.error(f"Database manager type: {type(self.db)}")
-                logger.error(f"Database manager attributes: {dir(self.db)}")
                 return
 
-            # Clear existing positions for these addresses first
-            addresses = list(positions.keys())
+            # CRITICAL: Separate addresses into 3 categories
+            addresses_with_positions = []
+            addresses_to_remove = []  # No positions or closed positions
+            addresses_to_skip = []     # API failures
 
-            # Use queries manager to bulk remove addresses
-            for market in self.db.config.target_markets:
-                await self.db.queries.bulk_remove_addresses(
-                    market.lower(), 
-                    addresses
-                )
+            for address in all_batch_addresses:
+                user_positions = positions.get(address)
 
-            # Prepare batch insert data
-            records = []
-            for address, user_positions in positions.items():
-                if not isinstance(user_positions, dict):
-                    logger.warning(f"Skipping invalid positions for {address}: {type(user_positions)}")
+                # Check if API call failed
+                if user_positions is None:
+                    addresses_to_skip.append(address)
                     continue
 
-                for market, pos in user_positions.items():
-                    # Skip closed positions
+                # Check if address has any active position in this market
+                has_active_position = False
+
+                if isinstance(user_positions, dict):
+                    for pos_market, pos in user_positions.items():
+                        if pos_market != market:
+                            continue
+
+                        # CRITICAL: More strict filtering
+                        if isinstance(pos, dict) and not pos.get('closed'):
+                            position_size = float(pos.get('position_size', 0))
+                            entry_price = float(pos.get('entry_price', 0))
+                            position_value_usd = float(pos.get('position_value', 0))
+
+                            # STRICT: Must have non-zero position, valid entry price, AND minimum USD value
+                            if (position_size != 0 and
+                                entry_price > 0 and
+                                position_value_usd >= self.config.min_position_value_usd):
+                                has_active_position = True
+                                addresses_with_positions.append(address)
+                                break
+
+                # If no active position found, mark for removal
+                if not has_active_position and user_positions is not None:
+                    addresses_to_remove.append(address)
+
+            # Build position records ONLY for addresses WITH positions
+            market_records = []
+            seen_addresses = set()  # Prevent duplicates
+
+            for address in addresses_with_positions:
+                # CRITICAL: Skip if we already processed this address
+                if address in seen_addresses:
+                    logger.warning(f"⚠️ Duplicate address detected: {address}")
+                    continue
+
+                user_positions = positions.get(address)
+                if not user_positions or not isinstance(user_positions, dict):
+                    continue
+
+                # Get positions for this specific market
+                for pos_market, pos in user_positions.items():
+                    if pos_market != market:
+                        continue
+
+                    # STRICT: Skip closed, invalid, or zero-size positions
                     if not isinstance(pos, dict) or pos.get('closed'):
                         continue
 
-                    # Get position size first to determine side
                     position_size = float(pos.get('position_size', 0))
-                    if position_size == 0:
-                        continue  # Skip zero positions
+                    entry_price = float(pos.get('entry_price', 0))
+                    position_value_usd = float(pos.get('position_value', 0))
 
-                    # Map position data to database fields - handle None values properly
-                    def safe_int(value, default=None):
-                        """Safely convert to int, handling None values."""
-                        if value is None:
-                            return default
-                        try:
-                            return int(float(value))  # Convert via float first for strings like "10.0"
-                        except (ValueError, TypeError):
-                            return default
+                    # CRITICAL: Must have non-zero position, valid entry price, AND minimum USD value
+                    if position_size == 0 or entry_price <= 0 or position_value_usd < self.config.min_position_value_usd:
+                        logger.debug(f"   Skipping {address}: size={position_size}, price={entry_price}, value_usd=${position_value_usd:.2f}")
+                        continue
 
-                    records.append((
-                        address.lower(),  # address VARCHAR(42)
-                        market.upper(),   # market VARCHAR(20)
-                        position_size,    # position_size NUMERIC(20, 8)
-                        safe_float(pos.get('entry_price'), None),  # entry_price NUMERIC(20, 8)
-                        safe_float(pos.get('liquidation_price'), None),  # liquidation_price NUMERIC(20, 8)
-                        safe_float(pos.get('margin_used'), 0.0),  # margin_used NUMERIC(20, 8)
-                        safe_float(pos.get('position_value'), 0.0),  # position_value NUMERIC(20, 8)
-                        safe_float(pos.get('unrealized_pnl'), 0.0),  # unrealized_pnl NUMERIC(20, 8)
-                        safe_float(pos.get('return_on_equity'), None),  # return_on_equity NUMERIC(10, 6)
-                        pos.get('leverage', {}).get('type', 'cross'),  # leverage_type VARCHAR(10)
-                        safe_int(pos.get('leverage', {}).get('value'), None),  # leverage_value INTEGER
-                        safe_float(pos.get('leverage', {}).get('rawUsd'), 0.0),  # leverage_raw_usd NUMERIC(20, 8)
-                        safe_float(pos.get('account_value'), 0.0),  # account_value NUMERIC(20, 8)
-                        safe_float(pos.get('total_margin_used'), 0.0),  # total_margin_used NUMERIC(20, 8)
-                        safe_float(pos.get('withdrawable'), 0.0)  # withdrawable NUMERIC(20, 8)
-                        # Note: last_updated is handled by the database (DEFAULT CURRENT_TIMESTAMP)
-                    ))
-
-            # Format records as position dictionaries for upsert
-            if records:
-                position_dicts = []
-                for record in records:
-                    position_dicts.append({
-                        'address': record[0],
-                        'market': record[1],
-                        'position_size': record[2],
-                        'entry_price': record[3],
-                        'liquidation_price': record[4],
-                        'margin_used': record[5],
-                        'position_value': record[6],
-                        'unrealized_pnl': record[7],
-                        'return_on_equity': record[8],
-                        'leverage_type': record[9],
-                        'leverage_value': record[10],
-                        'leverage_raw_usd': record[11],
-                        'account_value': record[12],
-                        'total_margin_used': record[13],
-                        'withdrawable': record[14]
+                    # Add to records and mark as seen
+                    market_records.append({
+                        'address': address,
+                        'position': pos
                     })
-                
-                # Use the database manager's upsert method
-                await self.db.upsert_positions_batch(position_dicts)
+                    seen_addresses.add(address)
+                    break  # Only one position per address per market
 
-            logger.info(f"✓ Stored {len(records)} positions for {len(addresses)} addresses")
+            # Helper functions for safe type conversion
+            def safe_float(value, default=0.0):
+                """Safely convert to float, handling None values."""
+                if value is None:
+                    return default if default is not None else None
+                try:
+                    return float(value)
+                except (ValueError, TypeError):
+                    return default if default is not None else None
+
+            def safe_int(value, default=None):
+                """Safely convert to int, handling None values."""
+                if value is None:
+                    return default
+                try:
+                    return int(float(value))  # Convert via float first for strings like "10.0"
+                except (ValueError, TypeError):
+                    return default
+
+            # Prepare position records with proper data types
+            position_records = []
+            for item in market_records:
+                address = item['address']
+                pos = item['position']
+
+                position_size = float(pos.get('position_size', 0))
+
+                position_records.append({
+                    'address': address.lower(),
+                    'market': market.upper(),
+                    'position_size': position_size,
+                    'entry_price': safe_float(pos.get('entry_price'), None),
+                    'liquidation_price': safe_float(pos.get('liquidation_price'), None),
+                    'margin_used': safe_float(pos.get('margin_used'), 0.0),
+                    'position_value': safe_float(pos.get('position_value'), 0.0),
+                    'unrealized_pnl': safe_float(pos.get('unrealized_pnl'), 0.0),
+                    'return_on_equity': safe_float(pos.get('return_on_equity'), None),
+                    'leverage_type': pos.get('leverage', {}).get('type', 'cross'),
+                    'leverage_value': safe_int(pos.get('leverage', {}).get('value'), None),
+                    'leverage_raw_usd': safe_float(pos.get('leverage', {}).get('rawUsd'), 0.0),
+                    'account_value': safe_float(pos.get('account_value'), 0.0),
+                    'total_margin_used': safe_float(pos.get('total_margin_used'), 0.0),
+                    'withdrawable': safe_float(pos.get('withdrawable'), 0.0)
+                })
+
+            # CRITICAL: Handle all three cases properly
+            # 1. UPSERT positions for addresses WITH positions
+            if position_records:
+                await self._upsert_positions(market, position_records)
+                logger.debug(f"✓ {market}: Upserted {len(position_records)} positions")
+
+            # 2. DELETE positions for addresses with NO/CLOSED positions
+            if addresses_to_remove:
+                token = market.lower()
+                await self.db.queries.bulk_remove_addresses(token, addresses_to_remove)
+                logger.debug(f"🗑️ {market}: Removed {len(addresses_to_remove)} addresses with closed/no positions")
+
+            # 3. Skip API failures (don't touch DB)
+            if addresses_to_skip:
+                logger.debug(f"⚠️ {market}: Skipped {len(addresses_to_skip)} addresses due to API failures")
+
+            # DETAILED LOGGING for debugging mismatches
+            logger.info(f"📊 {market} Batch Details:")
+            logger.info(f"   📥 Input: {len(all_batch_addresses)} addresses")
+            logger.info(f"   ✅ Active positions: {len(addresses_with_positions)} addresses → {len(position_records)} records")
+            logger.info(f"   🗑️ To remove: {len(addresses_to_remove)} addresses")
+            logger.info(f"   ⚠️ API failures: {len(addresses_to_skip)} addresses")
+
+            # Log any discrepancy between active addresses and position records
+            if len(addresses_with_positions) != len(position_records):
+                logger.warning(f"⚠️ {market} DISCREPANCY: {len(addresses_with_positions)} active addresses "
+                              f"but only {len(position_records)} position records created!")
+                logger.warning("   This suggests some addresses have invalid position data")
 
         except Exception as e:
             logger.error(f"Database write failed: {e}")
+
+    async def _upsert_positions(self, market: str, positions: List[Dict]):
+        """
+        UPSERT positions for addresses. Frontend-friendly - no unnecessary deletes.
+        Uses INSERT ... ON CONFLICT DO UPDATE for atomic upserts.
+        """
+        if not positions:
+            return
+
+        token = market.lower()
+        try:
+            await self.db.queries.upsert_positions(token, positions)
+        except Exception as e:
+            logger.error(f"❌ {market}: Failed to upsert positions: {e}")
+            raise
+
+    async def cleanup_against_snapshot(self, snapshot_addresses_by_market: Dict[str, Set[str]]):
+        try:
+            total_removed = 0
+            logger.info("=" * 80)
+            logger.info("🧹 STARTING AGGRESSIVE DATABASE CLEANUP")
+            logger.info("=" * 80)
+
+            for market, snapshot_addresses in snapshot_addresses_by_market.items():
+                token = market.lower()
+
+                # Get all addresses currently in database for this market
+                db_addresses = await self.db.queries.get_all_addresses_in_market(token)
+                db_set = set(addr.lower() for addr in db_addresses)
+
+                # Snapshot addresses are the source of truth
+                snapshot_set = set(addr.lower() for addr in snapshot_addresses)
+
+                # Find addresses in DB but NOT in snapshot
+                addresses_to_remove = list(db_set - snapshot_set)
+
+                if addresses_to_remove:
+                    logger.warning(f"⚠️ {market}: Found {len(addresses_to_remove)} STALE addresses in database")
+                    logger.info(f"   DB has: {len(db_addresses)} addresses")
+                    logger.info(f"   Snapshot has: {len(snapshot_addresses)} addresses")
+                    logger.info(f"   Removing: {len(addresses_to_remove)} stale addresses")
+
+                    # Remove in chunks to avoid query size limits
+                    chunk_size = 100
+                    for i in range(0, len(addresses_to_remove), chunk_size):
+                        chunk = addresses_to_remove[i:i+chunk_size]
+                        await self.db.queries.bulk_remove_addresses(token, chunk)
+
+                    logger.info(f"✅ {market}: Removed {len(addresses_to_remove)} stale addresses from database")
+                    total_removed += len(addresses_to_remove)
+                else:
+                    logger.info(f"✓ {market}: Database clean - all {len(db_addresses)} addresses match snapshot")
+
+            logger.info("=" * 80)
+            if total_removed > 0:
+                logger.warning(f"🎯 CLEANUP COMPLETE: Removed {total_removed} stale addresses across all markets")
+            else:
+                logger.info(f"✅ DATABASE CLEAN: All addresses match snapshot perfectly")
+            logger.info("=" * 80)
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup against snapshot: {e}")
+            raise
+
+    async def _clear_closed_positions(
+        self,
+        market: str,
+        addresses: List[str]
+    ):
+        """Clear positions for addresses that no longer have positions in this market."""
+        if not addresses:
+            return
+
+        token = market.lower()
+        try:
+            await self.db.queries.bulk_remove_addresses(token, addresses)
+            logger.debug(f"✓ {market}: Cleared {len(addresses)} addresses with closed positions")
+        except Exception as e:
+            logger.error(f"❌ {market}: Failed to clear closed positions: {e}")
 
     async def check_removal_candidates(
         self,
@@ -666,7 +912,7 @@ class PositionUpdater:
                     closed_positions[market].add(address)
 
         return closed_positions
-    
+
     def get_stats(self) -> Dict[str, int]:
         """Get API query statistics."""
         return self.api_stats.copy()
