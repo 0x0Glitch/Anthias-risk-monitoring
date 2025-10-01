@@ -21,16 +21,16 @@ BEGIN
     IF token_name !~ '^[a-zA-Z0-9_]+$' THEN
         RAISE EXCEPTION 'Invalid token name: %', token_name;
     END IF;
-    
+
     table_name := token_name || '_live_positions';
-    
+
     -- Create the positions table
     EXECUTE format('
         CREATE TABLE IF NOT EXISTS user_metrics.%I (
             -- Primary identifiers
             address VARCHAR(42) NOT NULL,
             market VARCHAR(20) NOT NULL,
-            
+
             -- Position details
             position_size NUMERIC(20, 8) NULL DEFAULT 0,
             entry_price NUMERIC(20, 8) NULL,
@@ -39,33 +39,33 @@ BEGIN
             position_value NUMERIC(20, 8) NULL,
             unrealized_pnl NUMERIC(20, 8) NULL,
             return_on_equity NUMERIC(10, 6) NULL,
-            
+
             -- Leverage information
-            leverage_type VARCHAR(10) NULL DEFAULT 'cross',
+            leverage_type VARCHAR(10) NULL DEFAULT ''''cross'''',
             leverage_value INTEGER NULL,
             leverage_raw_usd NUMERIC(20, 8) NULL,
-            
+
             -- Account information
             account_value NUMERIC(20, 8) NULL,
             total_margin_used NUMERIC(20, 8) NULL,
             withdrawable NUMERIC(20, 8) NULL,
-            
+
             -- Timestamps
             last_updated TIMESTAMP WITHOUT TIME ZONE NULL DEFAULT CURRENT_TIMESTAMP,
             created_at TIMESTAMP WITHOUT TIME ZONE NULL DEFAULT CURRENT_TIMESTAMP,
-            
+
             -- Primary key constraint
             CONSTRAINT %I PRIMARY KEY (address, market)
         );
     ', table_name, table_name || '_pkey');
-    
+
     -- Create indexes
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_%I_market ON user_metrics.%I USING btree (market);', table_name, table_name);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_%I_last_updated ON user_metrics.%I USING btree (last_updated);', table_name, table_name);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_%I_position_value ON user_metrics.%I USING btree (position_value);', table_name, table_name);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_%I_address ON user_metrics.%I USING btree (address);', table_name, table_name);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_%I_value_threshold ON user_metrics.%I (market, position_value) WHERE position_value >= 10000;', table_name, table_name);
-    
+
     -- Add comments
     EXECUTE format('COMMENT ON TABLE user_metrics.%I IS ''Real-time position data for %s trading pairs'';', table_name, token_name);
     EXECUTE format('COMMENT ON COLUMN user_metrics.%I.address IS ''Ethereum address of the trader (lowercase)'';', table_name);
@@ -125,8 +125,8 @@ CREATE OR REPLACE FUNCTION user_metrics.get_addresses_by_market_query()
 RETURNS TEXT AS $$
 BEGIN
     RETURN '
-        SELECT DISTINCT market, address 
-        FROM user_metrics.{token}_live_positions 
+        SELECT DISTINCT market, address
+        FROM user_metrics.{token}_live_positions
         WHERE position_value >= $1
         ORDER BY market, address
     ';
@@ -150,7 +150,7 @@ CREATE OR REPLACE FUNCTION user_metrics.get_overall_stats_query()
 RETURNS TEXT AS $$
 BEGIN
     RETURN '
-        SELECT 
+        SELECT
             COUNT(DISTINCT address) as unique_addresses,
             COUNT(*) as total_positions,
             SUM(position_value) as total_value_usd,
@@ -169,7 +169,7 @@ CREATE OR REPLACE FUNCTION user_metrics.get_market_stats_query()
 RETURNS TEXT AS $$
 BEGIN
     RETURN '
-        SELECT 
+        SELECT
             market,
             COUNT(DISTINCT address) as addresses,
             COUNT(*) as positions,
@@ -224,7 +224,7 @@ $$ LANGUAGE plpgsql;
 -- Bitcoin
 SELECT user_metrics.create_token_positions_table('btc');
 
--- Ethereum  
+-- Ethereum
 SELECT user_metrics.create_token_positions_table('eth');
 
 -- Chainlink

@@ -50,7 +50,8 @@ class PositionUpdater:
 
     async def update_positions(self, addresses_by_market: Dict[str, Set[str]]) -> Dict[str, Dict]:
         """
-        Update positions for all addresses - BATCH PROCESSING.
+        Update positions for all addresses - MARKET-BY-MARKET PROCESSING.
+        Each market is processed separately with its own batches and logging.
 
         Args:
             addresses_by_market: Dictionary of market -> addresses
@@ -59,104 +60,160 @@ class PositionUpdater:
             Dictionary of address -> position data
         """
 
-        # Flatten addresses for batch processing
-        all_addresses = []
-        address_to_markets = {}  # Track which markets each address trades
-
-        for market, addresses in addresses_by_market.items():
-            for address in addresses:
-                if address not in address_to_markets:
-                    address_to_markets[address] = []
-                address_to_markets[address].append(market)
-                all_addresses.append(address)
-
-        # Remove duplicates and sort for consistency
-        unique_addresses = sorted(list(set(all_addresses)))
-        logger.info(f"Processing {len(unique_addresses)} unique addresses in BATCHES...")
-
-        # Debug: Show what addresses we have
-        if not unique_addresses:
-            logger.warning("No addresses to process! Check address_manager state:")
-            logger.warning(f"addresses_by_market keys: {list(addresses_by_market.keys())}")
-            for market, addrs in addresses_by_market.items():
-                logger.warning(f"  {market}: {len(addrs)} addresses")
+        all_positions = {}
+        
+        if not addresses_by_market:
+            logger.info("No addresses to update")
             return {}
 
-        # BATCH PROCESSING - multiple addresses at once
-        all_positions = {}
-        total_api_failures = 0
-        total_no_positions = 0
-        total_positions_found = 0
-        successful_addresses = 0
+        # Calculate totals for overall summary
+        total_unique_addresses = set()
+        for addresses in addresses_by_market.values():
+            total_unique_addresses.update(addresses)
+        
+        total_addresses = len(total_unique_addresses)
+        total_markets = len(addresses_by_market)
 
-        # Process in batches
+        # Overall summary
+        logger.info("=" * 80)
+        logger.info("STARTING MULTI-MARKET POSITION UPDATE")
+        logger.info(f"Markets to process: {', '.join(addresses_by_market.keys())}")
+        logger.info(f"Total unique addresses: {total_addresses}")
+        logger.info(f"Markets: {total_markets}")
+        logger.info("=" * 80)
+
+        # Process each market separately
+        overall_stats = {
+            'successful_addresses': 0,
+            'total_api_failures': 0,
+            'total_no_positions': 0,
+            'total_positions_found': 0
+        }
+
+        for market_num, (market, addresses) in enumerate(addresses_by_market.items(), 1):
+            if not addresses:
+                logger.info(f"📍 Market {market_num}/{total_markets} - {market}: No addresses to process")
+                continue
+
+            logger.info("=" * 60)
+            logger.info(f"📍 PROCESSING MARKET {market_num}/{total_markets}: {market}")
+            logger.info(f"Addresses in {market}: {len(addresses)}")
+            logger.info("=" * 60)
+
+            # Process this market
+            market_positions, market_stats = await self._process_market_addresses(market, list(addresses))
+            
+            # Merge results
+            all_positions.update(market_positions)
+            
+            # Update overall stats
+            overall_stats['successful_addresses'] += market_stats['successful']
+            overall_stats['total_api_failures'] += market_stats['failures']
+            overall_stats['total_no_positions'] += market_stats['no_positions']
+            overall_stats['total_positions_found'] += market_stats['positions_found']
+
+            logger.info(f"✅ {market} complete: {market_stats['successful']} with positions, "
+                       f"{market_stats['no_positions']} no positions, {market_stats['failures']} failures")
+            
+            # Brief pause between markets
+            if market_num < total_markets:
+                await asyncio.sleep(1)
+
+        # Final overall summary
+        logger.info("=" * 80)
+        logger.info("MULTI-MARKET UPDATE SUMMARY")
+        logger.info(f"Markets processed: {total_markets}")
+        logger.info(f"Total unique addresses: {total_addresses}")
+        logger.info(f"✓ Addresses with positions: {overall_stats['successful_addresses']}")
+        logger.info(f"⚪ Addresses with no positions: {overall_stats['total_no_positions']}")
+        logger.info(f"❌ API failures: {overall_stats['total_api_failures']}")
+        logger.info(f"📊 Total positions found: {overall_stats['total_positions_found']}")
+        
+        success_rate = (overall_stats['successful_addresses'] / total_addresses * 100) if total_addresses else 0.0
+        avg_positions = (overall_stats['total_positions_found'] / overall_stats['successful_addresses']) if overall_stats['successful_addresses'] > 0 else 0.0
+        logger.info(f"Overall success rate: {success_rate:.1f}%")
+        logger.info(f"Avg positions per successful address: {avg_positions:.1f}")
+        logger.info("=" * 80)
+
+        return all_positions
+    
+    async def _process_market_addresses(self, market: str, addresses: List[str]) -> tuple[Dict[str, Dict], Dict[str, int]]:
+        """
+        Process addresses for a specific market with batch processing.
+        
+        Args:
+            market: Market name (e.g., 'BTC', 'ETH', 'LINK')  
+            addresses: List of addresses to process for this market
+            
+        Returns:
+            Tuple of (market_positions, market_stats)
+        """
+        
+        market_positions = {}
         batch_size = APIConfig.POSITION_BATCH_SIZE
-        total_batches = (len(unique_addresses) + batch_size - 1) // batch_size
+        total_batches = (len(addresses) + batch_size - 1) // batch_size
+        
+        # Counters for this market
+        successful_addresses = 0
+        api_failures = 0
+        no_positions = 0
+        positions_found = 0
 
         for batch_num in range(total_batches):
             start_idx = batch_num * batch_size
-            end_idx = min(start_idx + batch_size, len(unique_addresses))
-            batch_addresses = unique_addresses[start_idx:end_idx]
+            end_idx = min(start_idx + batch_size, len(addresses))
+            batch_addresses = addresses[start_idx:end_idx]
 
-            logger.info(f"🔄 Processing batch {batch_num + 1}/{total_batches} ({len(batch_addresses)} addresses)")
+            logger.info(f"  🔄 {market} batch {batch_num + 1}/{total_batches} ({len(batch_addresses)} addresses)")
 
             try:
+                # Create address to markets mapping for this specific market
+                address_to_markets = {addr: [market] for addr in batch_addresses}
+                
                 # Process batch of addresses
                 batch_results = await self._get_batch_positions(batch_addresses, address_to_markets)
 
                 for address, positions in batch_results.items():
                     if positions is None:
-                        # API failure - couldn't get response
-                        total_api_failures += 1
-                        logger.debug(f"❌ {address}: API failure")
+                        api_failures += 1
+                        logger.debug(f"    ❌ {address}: API failure")
                     elif len(positions) == 0:
-                        # API succeeded but no positions in target markets
-                        total_no_positions += 1
-                        logger.debug(f"⚪ {address}: No positions in target markets")
+                        no_positions += 1
+                        logger.debug(f"    ⚪ {address}: No positions in {market}")
                     else:
-                        # Success - found positions
-                        all_positions[address] = positions
+                        market_positions[address] = positions
                         positions_count = len(positions)
-                        total_positions_found += positions_count
+                        positions_found += positions_count
                         successful_addresses += 1
-                        logger.debug(f"✓ {address}: {positions_count} positions")
+                        logger.debug(f"    ✓ {address}: {positions_count} positions")
 
-                # Store all batch results at once
+                # Store batch results
                 if batch_results:
                     await self._store_positions(batch_results)
 
-                # Progress update
-                total_processed = successful_addresses + total_api_failures + total_no_positions
+                # Progress update for this market
+                total_processed = successful_addresses + api_failures + no_positions
                 success_rate = (successful_addresses / total_processed) * 100 if total_processed > 0 else 0
-                logger.info(f"  Batch {batch_num + 1} complete: {successful_addresses} with positions, "
-                           f"{total_no_positions} no positions, {total_api_failures} API failures ({success_rate:.1f}% found positions)")
+                logger.info(f"    Batch {batch_num + 1} complete: {successful_addresses} with positions, "
+                           f"{no_positions} no positions, {api_failures} API failures ({success_rate:.1f}% found positions)")
 
                 # Rate limiting between batches
                 await asyncio.sleep(APIConfig.BATCH_DELAY)
 
             except Exception as e:
-                logger.error(f"Failed to process batch {batch_num + 1}: {e}")
-                total_api_failures += len(batch_addresses)
-                # Longer delay after batch errors
+                logger.error(f"    Failed to process {market} batch {batch_num + 1}: {e}")
+                api_failures += len(batch_addresses)
                 await asyncio.sleep(APIConfig.BATCH_ERROR_DELAY)
                 continue
 
-        # Final summary
-        logger.info("=" * 60)
-        logger.info("POSITION UPDATE SUMMARY")
-        logger.info(f"Total addresses processed: {len(unique_addresses)}")
-        logger.info(f"✓ Addresses with positions: {successful_addresses}")
-        logger.info(f"⚪ Addresses with no positions: {total_no_positions}")
-        logger.info(f"❌ API failures: {total_api_failures}")
-        logger.info(f"📊 Total positions found: {total_positions_found}")
-        success_rate = (successful_addresses / len(unique_addresses) * 100) if unique_addresses else 0.0
-        avg_positions = (total_positions_found / successful_addresses) if successful_addresses > 0 else 0.0
-        logger.info(f"Success rate: {success_rate:.1f}%")
-        logger.info(f"Avg positions per address: {avg_positions:.1f}")
-        logger.info("=" * 60)
-
-        # Return positions dict as documented
-        return all_positions
+        market_stats = {
+            'successful': successful_addresses,
+            'failures': api_failures,
+            'no_positions': no_positions,
+            'positions_found': positions_found
+        }
+        
+        return market_positions, market_stats
 
     async def _get_batch_positions(
         self,
