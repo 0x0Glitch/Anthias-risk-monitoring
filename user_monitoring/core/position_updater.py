@@ -23,8 +23,8 @@ class PositionUpdater:
         self.session: Optional[aiohttp.ClientSession] = None
 
         # Limit concurrent HTTP calls to avoid rate limits
-        self._sem = asyncio.Semaphore(getattr(self.config, 'http_concurrency', APIConfig.DEFAULT_HTTP_CONCURRENCY))
-        self._retry_backoff = getattr(self.config, 'retry_backoff_sec', APIConfig.RETRY_BACKOFF_SEC)
+        self._sem = asyncio.Semaphore(getattr(self.config, 'max_workers', APIConfig.DEFAULT_HTTP_CONCURRENCY))
+        self._retry_backoff = getattr(self.config, 'retry_delay', APIConfig.RETRY_BACKOFF_SEC)
         self._api_call_delay = APIConfig.API_CALL_DELAY
 
         # Track API performance
@@ -493,113 +493,91 @@ class PositionUpdater:
                 logger.error(f"Database manager attributes: {dir(self.db)}")
                 return
 
-            async with self.db.pool.acquire() as conn:
-                # Use a transaction for atomicity
-                async with conn.transaction():
-                    # Clear existing positions for these addresses
-                    addresses = list(positions.keys())
+            # Clear existing positions for these addresses first
+            addresses = list(positions.keys())
 
-                    # Delete in chunks to avoid query size limits
-                    for i in range(0, len(addresses), 100):
-                        chunk = addresses[i:i+100]
-                        await conn.execute(
-                            "DELETE FROM live_positions WHERE address = ANY($1)",
-                            chunk
-                        )
+            # Use queries manager to bulk remove addresses
+            for market in self.db.config.target_markets:
+                await self.db.queries.bulk_remove_addresses(
+                    market.lower(), 
+                    addresses
+                )
 
-                    # Prepare batch insert data
-                    records = []
-                    for address, user_positions in positions.items():
-                        if not isinstance(user_positions, dict):
-                            logger.warning(f"Skipping invalid positions for {address}: {type(user_positions)}")
-                            continue
+            # Prepare batch insert data
+            records = []
+            for address, user_positions in positions.items():
+                if not isinstance(user_positions, dict):
+                    logger.warning(f"Skipping invalid positions for {address}: {type(user_positions)}")
+                    continue
 
-                        for market, pos in user_positions.items():
-                            # Skip closed positions
-                            if not isinstance(pos, dict) or pos.get('closed'):
-                                continue
+                for market, pos in user_positions.items():
+                    # Skip closed positions
+                    if not isinstance(pos, dict) or pos.get('closed'):
+                        continue
 
-                            # Get position size first to determine side
-                            position_size = float(pos.get('position_size', 0))
-                            if position_size == 0:
-                                continue  # Skip zero positions
+                    # Get position size first to determine side
+                    position_size = float(pos.get('position_size', 0))
+                    if position_size == 0:
+                        continue  # Skip zero positions
 
-                            # Map position data to database fields - handle None values properly
-                            def safe_float(value, default=0.0):
-                                """Safely convert to float, handling None values."""
-                                if value is None:
-                                    return default if default is not None else None
-                                try:
-                                    return float(value)
-                                except (ValueError, TypeError):
-                                    return default if default is not None else None
+                    # Map position data to database fields - handle None values properly
+                    def safe_int(value, default=None):
+                        """Safely convert to int, handling None values."""
+                        if value is None:
+                            return default
+                        try:
+                            return int(float(value))  # Convert via float first for strings like "10.0"
+                        except (ValueError, TypeError):
+                            return default
 
-                            def safe_int(value, default=None):
-                                """Safely convert to int, handling None values."""
-                                if value is None:
-                                    return default
-                                try:
-                                    return int(float(value))  # Convert via float first for strings like "10.0"
-                                except (ValueError, TypeError):
-                                    return default
+                    records.append((
+                        address.lower(),  # address VARCHAR(42)
+                        market.upper(),   # market VARCHAR(20)
+                        position_size,    # position_size NUMERIC(20, 8)
+                        safe_float(pos.get('entry_price'), None),  # entry_price NUMERIC(20, 8)
+                        safe_float(pos.get('liquidation_price'), None),  # liquidation_price NUMERIC(20, 8)
+                        safe_float(pos.get('margin_used'), 0.0),  # margin_used NUMERIC(20, 8)
+                        safe_float(pos.get('position_value'), 0.0),  # position_value NUMERIC(20, 8)
+                        safe_float(pos.get('unrealized_pnl'), 0.0),  # unrealized_pnl NUMERIC(20, 8)
+                        safe_float(pos.get('return_on_equity'), None),  # return_on_equity NUMERIC(10, 6)
+                        pos.get('leverage', {}).get('type', 'cross'),  # leverage_type VARCHAR(10)
+                        safe_int(pos.get('leverage', {}).get('value'), None),  # leverage_value INTEGER
+                        safe_float(pos.get('leverage', {}).get('rawUsd'), 0.0),  # leverage_raw_usd NUMERIC(20, 8)
+                        safe_float(pos.get('account_value'), 0.0),  # account_value NUMERIC(20, 8)
+                        safe_float(pos.get('total_margin_used'), 0.0),  # total_margin_used NUMERIC(20, 8)
+                        safe_float(pos.get('withdrawable'), 0.0)  # withdrawable NUMERIC(20, 8)
+                        # Note: last_updated is handled by the database (DEFAULT CURRENT_TIMESTAMP)
+                    ))
 
-                            records.append((
-                                address.lower(),  # address VARCHAR(42)
-                                market.upper(),   # market VARCHAR(20)
-                                position_size,    # position_size NUMERIC(20, 8)
-                                safe_float(pos.get('entry_price'), None),  # entry_price NUMERIC(20, 8)
-                                safe_float(pos.get('liquidation_price'), None),  # liquidation_price NUMERIC(20, 8)
-                                safe_float(pos.get('margin_used'), 0.0),  # margin_used NUMERIC(20, 8)
-                                safe_float(pos.get('position_value'), 0.0),  # position_value NUMERIC(20, 8)
-                                safe_float(pos.get('unrealized_pnl'), 0.0),  # unrealized_pnl NUMERIC(20, 8)
-                                safe_float(pos.get('return_on_equity'), None),  # return_on_equity NUMERIC(10, 6)
-                                pos.get('leverage', {}).get('type', 'cross'),  # leverage_type VARCHAR(10)
-                                safe_int(pos.get('leverage', {}).get('value'), None),  # leverage_value INTEGER
-                                safe_float(pos.get('leverage', {}).get('rawUsd'), 0.0),  # leverage_raw_usd NUMERIC(20, 8)
-                                safe_float(pos.get('account_value'), 0.0),  # account_value NUMERIC(20, 8)
-                                safe_float(pos.get('total_margin_used'), 0.0),  # total_margin_used NUMERIC(20, 8)
-                                safe_float(pos.get('withdrawable'), 0.0),  # withdrawable NUMERIC(20, 8)
-                                datetime.now()  # last_updated TIMESTAMP
-                            ))
+            # Format records as position dictionaries for upsert
+            if records:
+                position_dicts = []
+                for record in records:
+                    position_dicts.append({
+                        'address': record[0],
+                        'market': record[1],
+                        'position_size': record[2],
+                        'entry_price': record[3],
+                        'liquidation_price': record[4],
+                        'margin_used': record[5],
+                        'position_value': record[6],
+                        'unrealized_pnl': record[7],
+                        'return_on_equity': record[8],
+                        'leverage_type': record[9],
+                        'leverage_value': record[10],
+                        'leverage_raw_usd': record[11],
+                        'account_value': record[12],
+                        'total_margin_used': record[13],
+                        'withdrawable': record[14]
+                    })
+                
+                # Use the database manager's upsert method
+                await self.db.upsert_positions_batch(position_dicts)
 
-                    # Use COPY for fastest insertion
-                    if records:
-                        # Insert in smaller chunks
-                        chunk_size = 500
-                        for i in range(0, len(records), chunk_size):
-                            chunk = records[i:i+chunk_size]
-                            await conn.executemany(
-                                """
-                                INSERT INTO live_positions (
-                                    address, market, position_size, entry_price, liquidation_price,
-                                    margin_used, position_value, unrealized_pnl, return_on_equity,
-                                    leverage_type, leverage_value, leverage_raw_usd, account_value,
-                                    total_margin_used, withdrawable, last_updated
-                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-                                ON CONFLICT (address, market) DO UPDATE SET
-                                    position_size = EXCLUDED.position_size,
-                                    entry_price = EXCLUDED.entry_price,
-                                    liquidation_price = EXCLUDED.liquidation_price,
-                                    margin_used = EXCLUDED.margin_used,
-                                    position_value = EXCLUDED.position_value,
-                                    unrealized_pnl = EXCLUDED.unrealized_pnl,
-                                    return_on_equity = EXCLUDED.return_on_equity,
-                                    leverage_type = EXCLUDED.leverage_type,
-                                    leverage_value = EXCLUDED.leverage_value,
-                                    leverage_raw_usd = EXCLUDED.leverage_raw_usd,
-                                    account_value = EXCLUDED.account_value,
-                                    total_margin_used = EXCLUDED.total_margin_used,
-                                    withdrawable = EXCLUDED.withdrawable,
-                                    last_updated = EXCLUDED.last_updated
-                                """,
-                                chunk
-                            )
-
-                        logger.info(f"✓ Stored {len(records)} positions for {len(addresses)} addresses")
+            logger.info(f"✓ Stored {len(records)} positions for {len(addresses)} addresses")
 
         except Exception as e:
             logger.error(f"Database write failed: {e}")
-            # Continue anyway - don't crash the whole process
 
     async def check_removal_candidates(
         self,

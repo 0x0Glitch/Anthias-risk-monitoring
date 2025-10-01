@@ -53,6 +53,25 @@ class MonitorConfig:
     # Cleanup settings
     snapshot_retention_count: int = 2  # Keep only 2 latest JSON snapshots
     
+    def reload_markets(self) -> bool:
+        """
+        Reload TARGET_MARKETS from environment without restarting.
+        
+        Returns:
+            True if markets were updated, False otherwise
+        """
+        import os
+        
+        markets_str = os.getenv("TARGET_MARKETS", "BTC,ETH,LINK")
+        new_markets = [m.strip().upper() for m in markets_str.split(",") if m.strip()]
+        
+        if set(new_markets) != set(self.target_markets):
+            old_markets = self.target_markets
+            self.target_markets = new_markets
+            logger.info(f"Markets updated: {old_markets} -> {new_markets}")
+            return True
+        return False
+    
     @classmethod
     def from_env(cls) -> "MonitorConfig":
         """Create configuration from environment variables."""
