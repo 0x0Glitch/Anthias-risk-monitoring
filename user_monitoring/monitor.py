@@ -1,6 +1,4 @@
-"""
-Production-grade Hyperliquid Position Monitor with enterprise-level reliability.
-"""
+"""Hyperliquid Position Monitor."""
 import asyncio
 import signal
 import sys
@@ -27,7 +25,6 @@ from db.db_manager import DatabaseManager
 
 @dataclass
 class ComponentHealth:
-    """Health status of a component."""
     name: str
     healthy: bool
     last_success: Optional[datetime] = None
@@ -38,7 +35,6 @@ class ComponentHealth:
 
 @dataclass
 class MonitorStatistics:
-    """Comprehensive monitoring statistics."""
     start_time: datetime = field(default_factory=datetime.now)
     snapshots_processed: int = 0
     snapshots_failed: int = 0
@@ -74,20 +70,10 @@ class MonitorStatistics:
 
 
 class HyperliquidMonitor:
-    """
-    Enterprise-grade monitor with:
-    - Comprehensive error handling and recovery
-    - Health monitoring for all components
-    - Graceful degradation
-    - Automatic recovery mechanisms
-    - Detailed statistics and metrics
-    - Production logging
-    """
 
     def __init__(self, config: MonitorConfig):
         self.config = config
 
-        # Setup logging using centralized configuration
         log_dir = config.data_dir / "logs"
         self.logger = LoggingSetup.setup_logging(log_dir, log_level="INFO")
 
@@ -96,14 +82,11 @@ class HyperliquidMonitor:
         self.shutdown_event = asyncio.Event()
         self.force_shutdown = False
 
-        # Components
         self.db_manager = DatabaseManager(config)
         self.snapshot_processor = SnapshotProcessor(config)
         self.address_manager = AddressManager(config)
         self.position_updater = PositionUpdater(config, self.db_manager)
-        # Removed system_monitor as it doesn't exist in HIP3-users
 
-        # Health monitoring
         self.component_health = {
             'database': ComponentHealth('database', True),
             'snapshot_processor': ComponentHealth('snapshot_processor', True),
@@ -111,23 +94,17 @@ class HyperliquidMonitor:
             'address_manager': ComponentHealth('address_manager', True),
         }
 
-        # Statistics
         self.stats = MonitorStatistics()
         self.stats_file = config.data_dir / "monitor_stats.json"
-
-        # Task management
         self.tasks: List[asyncio.Task] = []
         self.task_errors: Dict[str, int] = {}
         self.max_task_errors = MonitoringThresholds.MAX_TASK_ERRORS
-
-        # Rate limiting
         self.snapshot_cooldown = timedelta(seconds=ProcessingIntervals.SNAPSHOT_COOLDOWN)
         self.last_snapshot_attempt = datetime.min
 
         self.logger.info("Monitor initialized")
 
     async def start(self) -> None:
-        """Start the monitoring system with comprehensive initialization."""
 
         self.logger.info("="*80)
         self.logger.info("HYPERLIQUID POSITION MONITOR v2.0 - PRODUCTION")
@@ -137,23 +114,13 @@ class HyperliquidMonitor:
         self.logger.info("="*80)
 
         try:
-            # Initialize all components
             await self._initialize_components()
-
-            # Setup signal handlers
             self._setup_signal_handlers()
-
-            # Perform initial seeding
             await self._initial_seeding()
-
-            # Start monitoring tasks
             self.running = True
             self.state = SystemState.RUNNING
             await self._start_tasks()
-
             self.logger.info("Monitor started successfully")
-
-            # Main event loop
             await self._main_loop()
 
         except KeyboardInterrupt:
@@ -166,11 +133,9 @@ class HyperliquidMonitor:
             await self.stop()
 
     async def _initialize_components(self) -> None:
-        """Initialize all components with proper error handling."""
 
         self.logger.info("Initializing components...")
 
-        # Initialize database
         try:
             await self.db_manager.initialize()
             self.component_health['database'].healthy = True
@@ -182,7 +147,6 @@ class HyperliquidMonitor:
             self.component_health['database'].last_error = str(e)
             raise
 
-        # Initialize position updater
         try:
             await self.position_updater.start()
             self.component_health['position_updater'].healthy = True
@@ -191,26 +155,21 @@ class HyperliquidMonitor:
             self.logger.warning(f"⚠ Position updater initialization warning: {e}")
             self.component_health['position_updater'].healthy = False
 
-        # Validate configuration
         self._validate_configuration()
 
         self.state = SystemState.READY
         self.logger.info("All components initialized")
 
     def _validate_configuration(self) -> None:
-        """Validate configuration and environment."""
 
         issues = []
 
-        # Check RMP path
         if not self.config.rmp_base_path.exists():
             issues.append(f"RMP path does not exist: {self.config.rmp_base_path}")
 
-        # Check node binary
         if not self.config.node_binary_path.exists():
             issues.append(f"hl-node binary not found: {self.config.node_binary_path}")
 
-        # Check data directory
         if not self.config.data_dir.exists():
             self.config.data_dir.mkdir(parents=True, exist_ok=True)
             self.logger.info(f"Created data directory: {self.config.data_dir}")
@@ -222,7 +181,6 @@ class HyperliquidMonitor:
             self.state = SystemState.DEGRADED
 
     async def _initial_seeding(self) -> None:
-        """Perform initial snapshot processing for seeding."""
 
         self.logger.info("Performing initial seeding from snapshots...")
 
@@ -230,17 +188,14 @@ class HyperliquidMonitor:
             success, users_by_market = await self.snapshot_processor.process_latest_snapshot()
 
             if success and users_by_market:
-                # Replace all addresses with those from snapshot (only active positions)
                 stats = await self.address_manager.replace_addresses(users_by_market)
                 self.stats.addresses_discovered = stats['total']
                 self.logger.info(f"Address manager updated: {stats['total']} addresses with active positions")
 
-                # Comprehensive position update for ALL addresses from snapshot
                 if users_by_market:
                     total_addrs = sum(len(addrs) for addrs in users_by_market.values())
                     self.logger.info(f"Performing comprehensive initial position update for {total_addrs} addresses...")
                     updated = await self.position_updater.update_positions(users_by_market)
-                    # Handle both int and dict return types
                     if isinstance(updated, dict):
                         self.stats.positions_updated += len(updated)
                         self.logger.info(f"✓ Initial positions updated: {len(updated)} addresses processed")
@@ -256,10 +211,8 @@ class HyperliquidMonitor:
 
         except Exception as e:
             self.logger.error(f"Initial seeding error: {e}", exc_info=True)
-            # Continue anyway - system can recover
 
     def _setup_signal_handlers(self) -> None:
-        """Setup signal handlers for graceful shutdown."""
 
         def signal_handler(sig, frame):
             if self.force_shutdown:
@@ -279,7 +232,6 @@ class HyperliquidMonitor:
         signal.signal(signal.SIGTERM, signal_handler)
 
     async def _start_tasks(self) -> None:
-        """Start all monitoring tasks."""
 
         self.tasks = [
             asyncio.create_task(self._snapshot_processor_task(), name="snapshot_processor"),
@@ -292,7 +244,6 @@ class HyperliquidMonitor:
         self.logger.info(f"Started {len(self.tasks)} monitoring tasks")
 
     async def _main_loop(self) -> None:
-        """Main event loop with task monitoring."""
 
         while self.running:
             try:

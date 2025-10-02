@@ -1,7 +1,4 @@
-"""
-Position updater using clearinghouseState API.
-Handles batch queries and updates live_positions table.
-"""
+"""Position updater using clearinghouseState API."""
 import asyncio
 import aiohttp
 import logging
@@ -15,19 +12,15 @@ logger = logging.getLogger(__name__)
 
 
 class PositionUpdater:
-    """Updates user positions via clearinghouseState API."""
 
     def __init__(self, config, db_manager):
         self.config = config
         self.db = db_manager
         self.session: Optional[aiohttp.ClientSession] = None
 
-        # Limit concurrent HTTP calls to avoid rate limits
         self._sem = asyncio.Semaphore(getattr(self.config, 'max_workers', APIConfig.DEFAULT_HTTP_CONCURRENCY))
         self._retry_backoff = getattr(self.config, 'retry_delay', APIConfig.RETRY_BACKOFF_SEC)
         self._api_call_delay = APIConfig.API_CALL_DELAY
-
-        # Track API performance
         self.api_stats = {
             'nvn_success': 0,
             'nvn_failures': 0,
@@ -37,28 +30,16 @@ class PositionUpdater:
         }
 
     async def start(self):
-        """Initialize the position updater."""
         timeout = aiohttp.ClientTimeout(total=self.config.api_timeout)
         self.session = aiohttp.ClientSession(timeout=timeout)
         logger.info("Position updater started")
 
     async def stop(self):
-        """Clean up resources."""
         if self.session:
             await self.session.close()
         logger.info(f"Position updater stopped. Stats: {self.api_stats}")
 
     async def update_positions(self, addresses_by_market: Dict[str, Set[str]]) -> Dict[str, Dict]:
-        """
-        Update positions for all addresses - MARKET-BY-MARKET PROCESSING.
-        Each market is processed separately with its own batches and logging.
-
-        Args:
-            addresses_by_market: Dictionary of market -> addresses
-
-        Returns:
-            Dictionary of address -> position data
-        """
 
         all_positions = {}
 
@@ -66,7 +47,6 @@ class PositionUpdater:
             logger.info("No addresses to update")
             return {}
 
-        # Calculate totals for overall summary
         total_unique_addresses = set()
         for addresses in addresses_by_market.values():
             total_unique_addresses.update(addresses)
@@ -74,7 +54,6 @@ class PositionUpdater:
         total_addresses = len(total_unique_addresses)
         total_markets = len(addresses_by_market)
 
-        # Overall summary
         logger.info("=" * 80)
         logger.info("STARTING MULTI-MARKET POSITION UPDATE")
         logger.info(f"Markets to process: {', '.join(addresses_by_market.keys())}")
@@ -82,7 +61,6 @@ class PositionUpdater:
         logger.info(f"Markets: {total_markets}")
         logger.info("=" * 80)
 
-        # Process each market separately
         overall_stats = {
             'successful_addresses': 0,
             'total_api_failures': 0,
@@ -100,13 +78,9 @@ class PositionUpdater:
             logger.info(f"Addresses in {market}: {len(addresses)}")
             logger.info("=" * 60)
 
-            # Process this market completely before moving to next
             market_positions, market_stats = await self._process_market_addresses(market, list(addresses))
 
-            # Wait for all database operations to complete before counting
             await asyncio.sleep(0.5)
-
-            # ENHANCED VERIFICATION: Check database count after processing
             actual_db_count = await self.db.queries.get_positions_count(market.lower())
             expected_count = len(market_positions)
 

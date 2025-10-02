@@ -1,7 +1,4 @@
-"""
-Constants and enums for Hyperliquid Position Monitoring System.
-Centralizes all magic numbers, system addresses, and configuration values.
-"""
+"""Constants and enums for Hyperliquid Position Monitoring System."""
 from enum import Enum
 from typing import Set
 
@@ -9,12 +6,11 @@ from typing import Set
 # SYSTEM ADDRESSES
 # =============================================================================
 
-# Ethereum addresses to filter out (system accounts, burn addresses)
 SYSTEM_ADDRESSES: Set[str] = {
-    '0x0000000000000000000000000000000000000000',  # Zero address
-    '0x0000000000000000000000000000000000000001',  # Genesis address
-    '0x000000000000000000000000000000000000dead',  # Burn address
-    '0xffffffffffffffffffffffffffffffffffffffff',  # Max address
+    '0x0000000000000000000000000000000000000000',
+    '0x0000000000000000000000000000000000000001',
+    '0x000000000000000000000000000000000000dead',
+    '0xffffffffffffffffffffffffffffffffffffffff',
 }
 
 
@@ -22,14 +18,11 @@ SYSTEM_ADDRESSES: Set[str] = {
 # VALIDATION CONSTANTS
 # =============================================================================
 
-# Address validation
-ADDRESS_LENGTH = 42  # Including '0x' prefix
+ADDRESS_LENGTH = 42
 ADDRESS_PREFIX = '0x'
 HEX_CHARS = '0123456789abcdefABCDEF'
-
-# Minimum file sizes for validation
-MIN_RMP_FILE_SIZE = 1000  # bytes
-MIN_JSON_FILE_SIZE = 1000  # bytes
+MIN_RMP_FILE_SIZE = 1000
+MIN_JSON_FILE_SIZE = 1000
 
 
 # =============================================================================
@@ -37,19 +30,13 @@ MIN_JSON_FILE_SIZE = 1000  # bytes
 # =============================================================================
 
 class DatabaseConfig:
-    """Database-related constants."""
-    # Connection pool settings
     MIN_POOL_SIZE = 5
     MAX_POOL_SIZE = 20
-    COMMAND_TIMEOUT = 60  # seconds
-
-    # Batch processing
+    COMMAND_TIMEOUT = 60
     MAX_BATCH_SIZE = 100
     INSERT_CHUNK_SIZE = 500
-
-    # Cleanup thresholds
     CLOSED_POSITION_MAX_AGE_HOURS = 24
-    STALE_POSITION_MAX_AGE_HOURS = 168  # 1 week
+    STALE_POSITION_MAX_AGE_HOURS = 168
 
 
 # =============================================================================
@@ -57,19 +44,13 @@ class DatabaseConfig:
 # =============================================================================
 
 class APIConfig:
-    """API-related constants."""
-    # Rate limiting
     DEFAULT_HTTP_CONCURRENCY = 5
-    API_CALL_DELAY = 0.1  # seconds between calls
+    API_CALL_DELAY = 0.1
     RETRY_BACKOFF_SEC = 0.5
-
-    # Batch sizes
     POSITION_BATCH_SIZE = 500
-    BATCH_TIMEOUT = 30.0  # seconds
-    BATCH_DELAY = 0.5  # seconds between batches
-
-    # Error handling
-    BATCH_ERROR_DELAY = 2.0  # seconds after batch errors
+    BATCH_TIMEOUT = 30.0
+    BATCH_DELAY = 0.5
+    BATCH_ERROR_DELAY = 2.0
 
 
 # =============================================================================
@@ -77,13 +58,12 @@ class APIConfig:
 # =============================================================================
 
 class ProcessingIntervals:
-    """Time intervals for various tasks (in seconds)."""
-    SNAPSHOT_CHECK = 120  # Check for new snapshots
-    POSITION_REFRESH = 10  # Refresh positions
-    HEALTH_MONITOR = 30  # Health checks
-    STATS_REPORT = 300  # Statistics reporting
-    CLEANUP = 3600  # Cleanup tasks
-    SNAPSHOT_COOLDOWN = 30  # Cooldown between snapshot attempts
+    SNAPSHOT_CHECK = 120
+    POSITION_REFRESH = 10
+    HEALTH_MONITOR = 30
+    STATS_REPORT = 300
+    CLEANUP = 3600
+    SNAPSHOT_COOLDOWN = 30
 
 
 # =============================================================================
@@ -91,14 +71,10 @@ class ProcessingIntervals:
 # =============================================================================
 
 class FileConfig:
-    """File management constants."""
-    # Snapshot retention
     MAX_SNAPSHOT_CACHE_SIZE = 100
-    SNAPSHOT_RETENTION_COUNT = 2  # Keep only 2 latest JSON snapshots
-
-    # File operations
-    FILE_READ_CHUNK_SIZE = 500 * 1024 * 1024  # 500MB chunks
-    HASH_BLOCK_SIZE = 4096  # bytes for hashing
+    SNAPSHOT_RETENTION_COUNT = 2
+    FILE_READ_CHUNK_SIZE = 500 * 1024 * 1024
+    HASH_BLOCK_SIZE = 4096
 
 
 # =============================================================================
@@ -106,12 +82,8 @@ class FileConfig:
 # =============================================================================
 
 class LogConfig:
-    """Logging configuration constants."""
-    # File sizes
-    MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB
-    MAX_ERROR_LOG_SIZE = 5 * 1024 * 1024  # 5MB
-
-    # Backup counts
+    MAX_LOG_SIZE = 10 * 1024 * 1024
+    MAX_ERROR_LOG_SIZE = 5 * 1024 * 1024
     LOG_BACKUP_COUNT = 5
     ERROR_LOG_BACKUP_COUNT = 3
 
@@ -121,16 +93,12 @@ class LogConfig:
 # =============================================================================
 
 class MonitoringThresholds:
-    """System health and monitoring thresholds."""
-    # Component health
     MAX_CONSECUTIVE_ERRORS = 5
     MAX_TASK_ERRORS = 10
     MAX_DEGRADED_COMPONENTS = 2
-
-    # Timeouts
-    CONVERSION_TIMEOUT = 300  # seconds for RMP conversion
-    SUBPROCESS_BUFFER_LIMIT = 1024 * 1024 * 10  # 10MB
-    SHUTDOWN_TIMEOUT = 10.0  # seconds for graceful shutdown
+    CONVERSION_TIMEOUT = 300
+    SUBPROCESS_BUFFER_LIMIT = 1024 * 1024 * 10
+    SHUTDOWN_TIMEOUT = 10.0
 
 
 # =============================================================================
@@ -138,7 +106,6 @@ class MonitoringThresholds:
 # =============================================================================
 
 class SystemState(Enum):
-    """System state enumeration."""
     INITIALIZING = "initializing"
     READY = "ready"
     RUNNING = "running"

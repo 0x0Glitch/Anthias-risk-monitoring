@@ -1,11 +1,9 @@
-"""Entry point for the Hyperliquid Position Monitor."""
+import sys
+import asyncio
+from monitor import main as monitor_main
+
 
 def main():
-    """Main entry point - delegates to monitor.py for the actual implementation."""
-    import sys
-    import asyncio
-    from monitor import main as monitor_main
-    
     try:
         exit_code = asyncio.run(monitor_main())
         sys.exit(exit_code)

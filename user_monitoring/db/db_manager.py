@@ -1,7 +1,4 @@
-"""
-Database manager for user metrics tables.
-Handles all database operations with connection pooling and token-specific tables.
-"""
+"""Database manager for user metrics tables."""
 import asyncpg
 import logging
 from pathlib import Path
@@ -16,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
-    """Manages database connections and operations for token-specific position monitoring."""
 
     def __init__(self, config):
         self.config = config
@@ -24,27 +20,20 @@ class DatabaseManager:
         self.queries: Optional[UserMetricsQueries] = None
 
     async def initialize(self):
-        """Initialize the database connection pool and schema."""
 
         try:
-            # Create connection pool with statement_cache_size=0 for pgbouncer compatibility
             self.pool = await asyncpg.create_pool(
                 self.config.database_url,
                 min_size=DatabaseConfig.MIN_POOL_SIZE,
                 max_size=DatabaseConfig.MAX_POOL_SIZE,
                 command_timeout=DatabaseConfig.COMMAND_TIMEOUT,
-                statement_cache_size=0,  # Disable statement cache for pgbouncer
-                server_settings={
-                    'jit': 'off'  # Disable JIT for better compatibility
-                }
+                statement_cache_size=0,
+                server_settings={'jit': 'off'}
             )
 
             await self._create_schema()
 
-            # Initialize query manager
             self.queries = UserMetricsQueries(self.pool)
-
-            # Ensure tables exist for configured markets
             await self._ensure_market_tables()
 
             logger.info("Database initialized successfully")
@@ -54,28 +43,17 @@ class DatabaseManager:
             raise
 
     async def close(self):
-        """Close database pool."""
 
         if self.pool:
             await self.pool.close()
             logger.info("Database pool closed")
 
     async def _create_schema(self):
-        """
-        Create database schema from external SQL file.
-        This keeps the schema definition separate from application logic.
-        """
-        # Locate schema file relative to this module
         schema_file = Path(__file__).parent / "schema.sql"
-
         if not schema_file.exists():
             raise FileNotFoundError(f"Schema file not found: {schema_file}")
-
-        # Read schema SQL
         with open(schema_file, 'r', encoding='utf-8') as f:
             schema_sql = f.read()
-
-        # Execute schema creation
         async with self.pool.acquire() as conn:
             await conn.execute(schema_sql)
 
@@ -83,8 +61,6 @@ class DatabaseManager:
             logger.info("Token-specific tables will be created as needed")
 
     async def _ensure_market_tables(self):
-        """Dynamically ensure tables exist for all configured target markets."""
-        # This method can be called periodically to check for new markets
         current_markets = set(self.config.target_markets)
 
         for market in current_markets:
@@ -93,36 +69,24 @@ class DatabaseManager:
                 await self.queries.create_token_table(token)
                 logger.info(f"Created positions table for {market}")
 
-        # Log current active markets
         logger.info(f"Active market tables: {', '.join(current_markets)}")
 
     async def reload_markets(self):
-        """
-        Reload TARGET_MARKETS from environment and ensure tables exist.
-        This allows dynamic addition of markets without restart.
-        """
         import os
 
-        # Reload TARGET_MARKETS from environment
         markets_str = os.getenv("TARGET_MARKETS", "BTC,ETH,LINK")
         new_markets = [m.strip().upper() for m in markets_str.split(",") if m.strip()]
-
-        # Check for new markets
         current_markets = set(self.config.target_markets)
         added_markets = set(new_markets) - current_markets
-
         if added_markets:
             logger.info(f"New markets detected: {', '.join(added_markets)}")
             self.config.target_markets = new_markets
-
-            # Ensure tables exist for new markets
             await self._ensure_market_tables()
 
         return new_markets
 
     @asynccontextmanager
     async def transaction(self):
-        """Get a database connection with transaction context."""
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():

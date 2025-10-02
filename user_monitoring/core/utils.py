@@ -1,17 +1,10 @@
-"""
-Utility functions for Hyperliquid Position Monitoring System.
-Extracts common helper functions used across multiple modules.
-"""
+"""Utility functions for Hyperliquid Position Monitoring System."""
 from typing import Any, Optional
 
 from config.constants import ADDRESS_LENGTH, ADDRESS_PREFIX, HEX_CHARS
 
 
 def is_ethereum_address(address: str) -> bool:
-    """
-    Check if a string is a valid Ethereum address (0x followed by 40 hex chars).
-    Extracted from snapshot_processor.py to avoid duplication.
-    """
     if not isinstance(address, str):
         return False
     address = address.strip()
@@ -23,10 +16,6 @@ def is_ethereum_address(address: str) -> bool:
 
 
 def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
-    """
-    Safely convert value to float.
-    Used in position_updater.py for API response parsing.
-    """
     if value is None:
         return default
     try:

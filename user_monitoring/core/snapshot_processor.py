@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SnapshotMetadata:
-    """Metadata for a snapshot."""
     path: Path
     height: int
     date: str
@@ -31,9 +30,6 @@ class SnapshotMetadata:
     status: ProcessingStatus = ProcessingStatus.PENDING
 
 class SnapshotProcessor:
-    """
-    Fixed snapshot processor using proper JSON parsing.
-    """
 
     def __init__(self, config):
         self.config = config
@@ -44,7 +40,6 @@ class SnapshotProcessor:
         self._load_state()
 
     def _load_state(self) -> None:
-        """Load processing state from disk."""
         if self.state_file.exists():
             try:
                 with open(self.state_file, 'r') as f:
@@ -67,7 +62,6 @@ class SnapshotProcessor:
                 self.processed_snapshots = {}
 
     def _save_state(self) -> None:
-        """Persist processing state to disk."""
         try:
             state_data = {}
             recent_snapshots = sorted(
@@ -96,7 +90,6 @@ class SnapshotProcessor:
             logger.error(f"Failed to save snapshot state: {e}")
 
     def _calculate_file_hash(self, path: Path) -> str:
-        """Calculate SHA256 hash of file for deduplication."""
         sha256_hash = hashlib.sha256()
         try:
             with open(path, "rb") as f:
@@ -108,7 +101,6 @@ class SnapshotProcessor:
             return str(path)
 
     async def find_latest_unprocessed_snapshot(self) -> Optional[SnapshotMetadata]:
-        """Find the latest unprocessed RMP snapshot."""
         if not self.config.rmp_base_path.exists():
             logger.warning(f"RMP base path does not exist: {self.config.rmp_base_path}")
             return None
@@ -157,7 +149,6 @@ class SnapshotProcessor:
             return None
 
     async def convert_rmp_to_json(self, metadata: SnapshotMetadata) -> Optional[Path]:
-        """Convert RMP to JSON with proper error handling and retries."""
         if not self.config.node_binary_path.exists():
             logger.error(f"hl-node binary not found at {self.config.node_binary_path}")
             return None
@@ -229,10 +220,6 @@ class SnapshotProcessor:
         return None
 
     def _derive_asset_indices(self, data: Dict) -> Tuple[Dict[str, int], Dict[str, float]]:
-        """
-        Derive asset indices and mark prices from meta.universe in the snapshot.
-        NEVER hardcode indices - they can change between snapshots!
-        """
         market_to_index = {}
         market_to_price = {}
 
@@ -252,7 +239,6 @@ class SnapshotProcessor:
                                 market_to_index[name] = i
                                 logger.info(f"✓ Found target market {name} at index {i}")
 
-                        # Extract mark prices from asset_ctxs
                         if 'asset_ctxs' in dex['clearinghouse']['meta']:
                             asset_ctxs = dex['clearinghouse']['meta']['asset_ctxs']
                             if isinstance(asset_ctxs, list) and len(asset_ctxs) == len(universe):
@@ -268,19 +254,11 @@ class SnapshotProcessor:
                                                 logger.warning(f"Invalid mark_px for {market}: {ctx.get('mark_px')}")
                                                 market_to_price[market] = 1.0  # Fallback
 
-                        break  # Use first dex with universe
+                        break
 
         return market_to_index, market_to_price
 
-    async def extract_positions_from_rmp_direct(
-        self,
-        rmp_path: Path,
-        metadata: SnapshotMetadata
-    ) -> Dict[str, Set[str]]:
-        """
-        DIRECT RMP PROCESSING: Parse MessagePack directly without JSON conversion.
-        Uses the same proven logic as extract_link_from_rmp_direct.py
-        """
+    async def extract_positions_from_rmp_direct(self, rmp_path: Path, metadata: SnapshotMetadata) -> Dict[str, Set[str]]:
 
         result: Dict[str, Set[str]] = {
             market: set() for market in self.config.target_markets
@@ -290,13 +268,11 @@ class SnapshotProcessor:
             logger.info(f"🔄 DIRECT RMP PARSING from {rmp_path}...")
             logger.info(f"File size: {rmp_path.stat().st_size / (1024*1024):.1f}MB")
 
-            # Load RMP data directly with msgpack
             with open(rmp_path, 'rb') as f:
                 data = msgpack.unpack(f, raw=False, strict_map_key=False)
 
             logger.info("✅ Successfully loaded RMP data into memory")
 
-            # Derive asset indices and mark prices from this snapshot's universe (NEVER hardcode!)
             market_to_index, market_to_price = self._derive_asset_indices(data)
 
             if not market_to_index:

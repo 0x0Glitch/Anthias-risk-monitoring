@@ -1,8 +1,4 @@
-"""
-Dynamic market-specific address manager with per-market file persistence.
-Maintains separate {market}_addresses.txt files for each monitored market.
-Mirrors the single-market implementation logic but extends to multiple markets.
-"""
+"""Market-specific address manager with per-market file persistence."""
 import asyncio
 import logging
 from pathlib import Path
@@ -14,11 +10,6 @@ logger = logging.getLogger(__name__)
 
 
 class AddressManager:
-    """
-    Manages active addresses with market-specific file persistence.
-    Maintains separate address files for each market (btc_addresses.txt, eth_addresses.txt, etc.)
-    Uses the EXACT same dual-check logic as single-market version.
-    """
 
     def __init__(self, config):
         self.config = config
@@ -26,36 +17,26 @@ class AddressManager:
         self.file_lock = asyncio.Lock()
         self.lock = Lock()  # Threading lock for thread-safe operations
 
-        # Initialize market-specific structures
         self.addresses_by_market: Dict[str, Set[str]] = {}
         self.removal_candidates: Dict[str, Set[str]] = {}
         self.last_snapshot_addresses: Dict[str, Set[str]] = {}
-
-        # General active addresses set (union of all markets)
         self.active_addresses: Set[str] = set()
 
-        # Initialize for all target markets
         for market in config.target_markets:
             self.addresses_by_market[market] = set()
             self.removal_candidates[market] = set()
             self.last_snapshot_addresses[market] = set()
 
-        # Load existing addresses from market-specific files
         self._load_all_market_addresses()
 
         logger.info(f"AddressManager initialized for markets: {', '.join(config.target_markets)}")
 
     def _is_valid_address(self, address: str) -> bool:
-        """Check if address is a valid Ethereum address."""
         import re
         if not isinstance(address, str):
             return False
-
-        # Remove any market prefix if present
         if ':' in address:
             address = address.split(':', 1)[1]
-
-        # Check if it's a valid Ethereum address format
         return bool(re.match(r'^0x[a-fA-F0-9]{40}$', address.strip()))
 
     def _get_market_file(self, market: str) -> Path:
@@ -67,7 +48,6 @@ class AddressManager:
         for market in self.config.target_markets:
             self._load_market_addresses(market)
 
-        # Update general active addresses set
         self.active_addresses = set()
         for addresses in self.addresses_by_market.values():
             self.active_addresses.update(addresses)
@@ -105,20 +85,13 @@ class AddressManager:
                 # Ensure directory exists
                 market_file.parent.mkdir(parents=True, exist_ok=True)
 
-                # Write addresses to file (atomic write using temp file)
                 tmp_path = Path(str(market_file) + '.tmp')
-
                 with open(tmp_path, 'w') as f:
-                    # Write header
                     f.write(f"# {market} addresses\n")
                     f.write(f"# Generated: {datetime.now().isoformat()}\n")
                     f.write(f"# Count: {len(self.addresses_by_market.get(market, set()))}\n\n")
-
-                    # Write addresses sorted
                     for address in sorted(self.addresses_by_market.get(market, set())):
                         f.write(f"{address}\n")
-
-                # Atomic replace
                 tmp_path.replace(market_file)
 
                 logger.debug(f"Saved {len(self.addresses_by_market.get(market, set()))} addresses for {market}")
@@ -135,31 +108,16 @@ class AddressManager:
             await self.save_market_addresses(market)
 
     def _save_to_file_sync(self):
-        """Synchronous version of save for use within threading lock."""
-        # Create an event loop if needed or run in existing one
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # Schedule the coroutine to run later
                 asyncio.create_task(self.save_all_market_addresses())
             else:
-                # Run it now
                 loop.run_until_complete(self.save_all_market_addresses())
         except RuntimeError:
-            # No event loop, create one
             asyncio.run(self.save_all_market_addresses())
 
     def update_from_snapshot(self, snapshot_addresses: Dict[str, Set[str]]) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
-        """
-        Update addresses from new snapshot with dual-check logic.
-        EXACT same logic as single-market version, just for multiple markets.
-
-        Args:
-            snapshot_addresses: Dictionary of market -> addresses from snapshot
-
-        Returns:
-            Tuple of (new_addresses, removal_candidates)
-        """
 
         with self.lock:
             new_addresses = {market: set() for market in self.config.target_markets}
@@ -170,19 +128,14 @@ class AddressManager:
                 current_active = self.addresses_by_market[market]
                 previous_snapshot = self.last_snapshot_addresses[market]
 
-                # Find new addresses
                 new = current_snapshot - current_active
                 if new:
                     new_addresses[market] = new
                     self.addresses_by_market[market].update(new)
                     logger.info(f"Added {len(new)} new {market} addresses")
 
-                # Find removal candidates (in previous snapshot but not in current)
                 if previous_snapshot:
-                    # Addresses that were in previous snapshot but not in current
                     disappeared = previous_snapshot - current_snapshot
-
-                    # Only consider for removal if they're currently active
                     candidates = disappeared & current_active
 
                     if candidates:
@@ -190,27 +143,17 @@ class AddressManager:
                         self.removal_candidates[market].update(candidates)
                         logger.info(f"Marked {len(candidates)} {market} addresses as removal candidates")
 
-                # Update last snapshot
                 self.last_snapshot_addresses[market] = current_snapshot.copy()
 
-            # Update general active addresses set
             self.active_addresses = set()
             for addresses in self.addresses_by_market.values():
                 self.active_addresses.update(addresses)
-
-            # Save updated addresses to files
             if any(new_addresses.values()):
                 self._save_to_file_sync()
 
             return new_addresses, new_removal_candidates
 
     async def confirm_removals(self, closed_positions: Dict[str, Set[str]]):
-        """
-        Confirm removal of addresses with closed positions (dual-check complete).
-
-        Args:
-            closed_positions: Dictionary of market -> addresses with closed positions
-        """
 
         with self.lock:
             total_removed = 0
