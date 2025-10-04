@@ -17,8 +17,11 @@ futures-util = "0.3.31"
 rayon = "1.10"
 alloy = "1.0.22"
 strum_macros = "0.27.2"
-reqwest = "0.12.22"
+reqwest = { version = "0.12.22", features = ["json"] }
 yawc = { version = "0.2.6", features = ["axum"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+deadpool-postgres = "0.14"
+rust_decimal = { version = "1.36", features = ["db-tokio-postgres"] }
 
 [lints]
 workspace = true

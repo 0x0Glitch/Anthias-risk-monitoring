@@ -4,6 +4,7 @@ mod order_book;
 mod prelude;
 mod servers;
 mod types;
+pub mod market_metrics;
 
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;

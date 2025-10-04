@@ -25,6 +25,11 @@ struct Args {
     /// documentation for <https://docs.rs/flate2/1.1.2/flate2/struct.Compression.html#method.new> for more info.
     #[arg(long)]
     websocket_compression_level: Option<u32>,
+
+    /// Enable market metrics monitoring and database insertion
+    /// Requires DATABASE_URL and TARGET_MARKETS environment variables
+    #[arg(long, default_value = "false")]
+    enable_metrics: bool,
 }
 
 #[tokio::main]
@@ -35,9 +40,12 @@ async fn main() -> Result<()> {
 
     let full_address = format!("{}:{}", args.address, args.port);
     println!("Running websocket server on {full_address}");
+    if args.enable_metrics {
+        println!("✅ Market metrics monitoring ENABLED");
+    }
 
     let compression_level = args.websocket_compression_level.unwrap_or(/* Some compression */ 1);
-    run_websocket_server(&full_address, true, compression_level).await?;
+    run_websocket_server(&full_address, true, compression_level, args.enable_metrics).await?;
 
     Ok(())
 }

@@ -29,7 +29,12 @@ use tokio::{
 };
 use yawc::{FrameView, OpCode, WebSocket};
 
-pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_level: u32) -> Result<()> {
+pub async fn run_websocket_server(
+    address: &str,
+    ignore_spot: bool,
+    compression_level: u32,
+    enable_metrics: bool,
+) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
 
     // Central task: listen to messages and forward them for distribution
@@ -47,6 +52,13 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
                 std::process::exit(1);
             }
         });
+    }
+
+    // Start market metrics monitoring if enabled (spawn after server starts to avoid blocking)
+    if enable_metrics {
+        info!("📊 Market metrics monitoring enabled - will initialize in background");
+        let listener_for_metrics = listener.clone();
+        tokio::spawn(init_metrics_monitor(listener_for_metrics));
     }
 
     let websocket_opts =
@@ -369,5 +381,35 @@ impl Subscription {
             return Err("Snapshot Failed".into());
         }
         Ok(None)
+    }
+}
+
+async fn init_metrics_monitor(listener: Arc<Mutex<OrderBookListener>>) {
+    use crate::market_metrics::{MarketMetricsMonitor, MetricsConfig};
+
+    info!("📊 Initializing market metrics monitoring...");
+
+    match MetricsConfig::from_env() {
+        Ok(config) => {
+            info!("✅ Metrics config loaded: {:?}", config.target_markets);
+            info!("   Database: {}...", &config.database_url[..config.database_url.len().min(30)]);
+
+            match MarketMetricsMonitor::new(config, listener).await {
+                Ok(monitor) => {
+                    info!("✅ Market metrics monitor initialized");
+                    let monitor = Arc::new(monitor);
+                    monitor.start().await;
+                }
+                Err(e) => {
+                    error!("❌ Failed to initialize market metrics monitor: {}", e);
+                    error!("   Server will continue without metrics monitoring");
+                }
+            }
+        }
+        Err(e) => {
+            error!("❌ Failed to load metrics config: {}", e);
+            error!("   Required: DATABASE_URL and TARGET_MARKETS environment variables");
+            error!("   Server will continue without metrics monitoring");
+        }
     }
 }
